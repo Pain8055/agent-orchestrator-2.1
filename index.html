@@ -2121,7 +2121,10 @@ const ATTACH_RE = /⟦⟦ATTACH:([a-z0-9]+):([^⟧]*)⟧⟧([\s\S]*?)⟦⟦ENDAT
 // Old format, kept only so chats saved before this fix still render/redact correctly.
 const ATTACH_RE_LEGACY = /\[\[file:([^\]]+)\]\]([\s\S]*?)\[\[\/file\]\]/g;
 
-function sanitizeForHistory(content) {
+const HISTORY_CHAR_BUDGET = 12000;
+const HISTORY_RECENT_TURNS = 6;
+
+function sanitizeForHistory(content, limit = 2400) {
   if (!content) return "";
   // Don't resend full file/tool content on every future turn — that's what burns tokens.
   // Only a short placeholder goes into history; an agent that actually needs the current
@@ -2129,14 +2132,33 @@ function sanitizeForHistory(content) {
   let c = content.replace(ATTACH_RE, "[attached file omitted from history — re-fetch it if you need the current content]");
   c = c.replace(ATTACH_RE_LEGACY, "[attached file omitted from history — re-fetch it if you need the current content]");
   c = c.replace(/!\[[^\]]*\]\(data:[^)]+\)/g, "[image omitted from history]");
-  if (c.length > 800) c = c.slice(0, 800) + "...[truncated]";
+  if (c.length > limit) c = c.slice(0, limit) + "...[truncated]";
   return c;
 }
 
 function buildHistoryForAgent(msgsArray, excludeLastN = 1) {
   const trimmed = msgsArray.slice(0, msgsArray.length - excludeLastN);
-  const recent = trimmed.slice(-8); // cap to last 8 turns to control token usage
-  return recent.map(m => ({ role: m.role, content: sanitizeForHistory(m.content) }));
+  const turns = [];
+  for (let i = trimmed.length - 1; i >= 0; i--) {
+    const message = trimmed[i];
+    if (message.role === "assistant" && i > 0 && trimmed[i - 1].role === "user") {
+      turns.unshift([trimmed[i - 1], message]);
+      i--;
+    } else {
+      turns.unshift([message]);
+    }
+  }
+  const selected = [];
+  let remaining = HISTORY_CHAR_BUDGET;
+  for (const turn of turns.slice(-HISTORY_RECENT_TURNS).reverse()) {
+    const prepared = turn.map(m => ({ role: m.role, content: sanitizeForHistory(m.content, remaining) }));
+    const size = prepared.reduce((total, m) => total + m.content.length, 0);
+    if (selected.length && size > remaining) break;
+    selected.unshift(...prepared);
+    remaining -= size;
+    if (remaining <= 0) break;
+  }
+  return selected;
 }
 
 // ---------------- Agent tools: GitHub, code execution, ask/handoff to another agent ----------------
@@ -2235,15 +2257,20 @@ function tryArgKeyValueFormat(text) {
 }
 
 function parseAgentAction(text) {
+  const normalized = text.replace(/<\\\/(gh_action|run_code|ask_agent|handoff_to)\s*>/gi, "</$1>");
   for (const [tag, type] of AGENT_TOOL_TAGS) {
-    const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
+    const m = normalized.match(new RegExp(`<${tag}\\s*>([\\s\\S]*?)<\\/${tag}\\s*>`, "i"));
     if (!m) continue;
     let raw = m[1].trim().replace(/^```(json)?/i, "").replace(/```$/, "").trim();
     const obj = lenientJsonParse(raw);
     if (!validAgentPayload(type, obj)) continue;
     return { type, payload: obj };
   }
-  return tryArgKeyValueFormat(text);
+  return tryArgKeyValueFormat(normalized);
+}
+
+function hasToolDirective(text) {
+  return /<(gh_action|run_code|ask_agent|handoff_to)\b/i.test(text);
 }
 
 // Last-resort cosmetic cleanup: some models leak their own native function-calling wrapper
@@ -2394,6 +2421,9 @@ async function callAgent(role, prompt, maxTokens = null, images = null, history 
 
     const parsed = parseAgentAction(stepText);
     if (!parsed) {
+      if (hasToolDirective(stepText)) {
+        return "[The agent returned a malformed tool request, so it was not shown as a reply or executed. Please try the request again.]";
+      }
       return stripStrayToolTags(stepText); // final answer — no (valid) tool call
     }
 
@@ -2583,12 +2613,18 @@ Task: ${clean}`;
   for (let i = 0; i < steps.length; i++) {
     const [role, desc] = steps[i];
     updatePipeline(traceEl, steps.map(s => s[0]), i);
+    const priorResults = stepResults.length
+      ? stepResults.map(([previousRole, previousDesc, previousResult]) =>
+        `[${previousRole.toUpperCase()} — ${previousDesc}]\n${previousResult}`
+      ).join("\n\n").slice(-9000)
+      : "(No earlier step results.)";
+    const stepPrompt = `Original task: ${clean}\n\nYour assigned step: ${desc}\n\nCompleted earlier steps:\n${priorResults}\n\nUse the earlier results when this step depends on them. Return the result needed by the next step.`;
     let result;
     if (role === "search") {
       const results = await webSearch(desc);
-      result = await callAgent("head", `Summarize for: ${desc}\n\n${results}`, null, null, history);
+      result = await callAgent("head", `${stepPrompt}\n\nSearch results:\n${results}`, null, null, history);
     } else {
-      result = await callAgent(role, desc, null, null, history);
+      result = await callAgent(role, stepPrompt, null, null, history);
     }
     stepResults.push([role, desc, result]);
   }
@@ -3571,9 +3607,19 @@ async function touchConversation(convId, title = null) {
   await sb.from("conversations").update(update).eq("id", convId);
 }
 
+const MESSAGE_LOAD_LIMIT = 60;
+
 async function loadMessages(branchId) {
-  const { data } = await sb.from("chat_history").select("*").eq("branch_id", branchId).order("id");
-  return data || [];
+  // Loading an entire branch made opening older, attachment-heavy chats block the UI.
+  // The agent only uses the recent context window, so the newest messages are the useful
+  // first page; older history can be reached through branches/exports without delaying chat.
+  const { data, error } = await sb.from("chat_history")
+    .select("id,user_id,conversation_id,branch_id,role,content,version_group,created_at")
+    .eq("branch_id", branchId)
+    .order("id", { ascending: false })
+    .limit(MESSAGE_LOAD_LIMIT);
+  if (error) throw new Error("Failed to load messages: " + error.message);
+  return (data || []).reverse();
 }
 
 async function saveMessage(uid, convId, branchId, role, content) {
@@ -3929,8 +3975,10 @@ async function confirmDeleteConversation(conv) {
 
 let allConvs = [];
 let currentBranchId = null;
+let conversationLoadEpoch = 0;
 
 async function openConversation(conv) {
+  const loadEpoch = ++conversationLoadEpoch;
   currentConvId = conv.id;
   currentBranchId = conv.active_branch_id;
 
@@ -3960,8 +4008,12 @@ async function openConversation(conv) {
 
     renderConvList(allConvs, currentConvId);
     document.getElementById("log").innerHTML = "";
-    messages = await loadMessages(currentBranchId);
-    versionMap = await buildVersionMap(messages);
+    const branchId = currentBranchId;
+    const loadedMessages = await loadMessages(branchId);
+    const loadedVersionMap = await buildVersionMap(loadedMessages);
+    if (loadEpoch !== conversationLoadEpoch || currentConvId !== conv.id || currentBranchId !== branchId) return;
+    messages = loadedMessages;
+    versionMap = loadedVersionMap;
     await renderMessageBatch(messages);
     if (window.innerWidth <= 768) toggleSidebar();
   } catch (e) {
@@ -4539,14 +4591,18 @@ async function switchVersion(targetBranchId) {
   // completely unguarded — a failure here (a bad row, a network blip) left the log blank
   // with no error and no way back short of a reload.
   try {
+    const loadEpoch = ++conversationLoadEpoch;
     const { error } = await sb.from("conversations").update({ active_branch_id: targetBranchId }).eq("id", currentConvId);
     if (error) throw new Error(error.message);
     const conv = allConvs.find(c => c.id === currentConvId);
     if (conv) conv.active_branch_id = targetBranchId;
     currentBranchId = targetBranchId;
     document.getElementById("log").innerHTML = "";
-    messages = await loadMessages(targetBranchId);
-    versionMap = await buildVersionMap(messages);
+    const loadedMessages = await loadMessages(targetBranchId);
+    const loadedVersionMap = await buildVersionMap(loadedMessages);
+    if (loadEpoch !== conversationLoadEpoch || currentBranchId !== targetBranchId) return;
+    messages = loadedMessages;
+    versionMap = loadedVersionMap;
     await renderMessageBatch(messages);
   } catch (e) {
     showError("Couldn't switch versions: " + e.message);
