@@ -1,16 +1,34 @@
-self.addEventListener('install', (e) => {
-  self.skipWaiting();
+const CACHE_NAME = 'agent-team-shell-v1';
+const APP_SHELL = ['./', './index.html', './manifest.json'];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then((cache) => cache.addAll(APP_SHELL))
+      .then(() => self.skipWaiting())
+  );
 });
 
-self.addEventListener('activate', (e) => {
-  self.clients.claim();
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(
+        keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))
+      ))
+      .then(() => self.clients.claim())
+  );
 });
 
-self.addEventListener('fetch', (e) => {
-  // Network-first passthrough — this app needs live data (Groq/Gemini/OpenRouter/Supabase),
-  // so we deliberately don't cache API responses. This handler's presence is what satisfies
-  // browser PWA-installability checks and gives basic offline resilience for the app shell.
-  e.respondWith(
-    fetch(e.request).catch(() => caches.match(e.request))
+self.addEventListener('fetch', (event) => {
+  // Keep API calls network-only so chat data and provider responses never become stale.
+  if (event.request.method !== 'GET' || new URL(event.request.url).origin !== self.location.origin) {
+    return;
+  }
+
+  event.respondWith(
+    fetch(event.request).catch(async () => {
+      const cached = await caches.match(event.request);
+      return cached || (event.request.mode === 'navigate' ? caches.match('./index.html') : Response.error());
+    })
   );
 });
