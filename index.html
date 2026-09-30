@@ -1889,7 +1889,7 @@
   </div>
 </div>
 
-<div class="hint-popup-overlay" id="ghApprovalOverlay" style="display:none; z-index:200;">
+<div class="hint-popup-overlay" id="ghApprovalOverlay" style="display:none; z-index:400;">
   <div class="hint-popup">
     <div class="hint-popup-title">🔗 <span id="ghApprovalRole"></span> agent wants to write to GitHub</div>
     <div id="ghApprovalSummary" style="font-family:var(--mono); font-size:12.5px; color:var(--text); line-height:1.6; margin-bottom:12px; max-height:260px; overflow-y:auto;"></div>
@@ -1955,6 +1955,13 @@ function toggleSidebar() {
   sidebar.classList.toggle("collapsed");
   if (isMobile) {
     overlay.classList.toggle("show", !sidebar.classList.contains("collapsed"));
+  }
+}
+
+function closeMobileSidebar() {
+  if (window.innerWidth <= 768) {
+    sidebar.classList.add("collapsed");
+    overlay.classList.remove("show");
   }
 }
 
@@ -2132,7 +2139,11 @@ function sanitizeForHistory(content, limit = 2400) {
   let c = content.replace(ATTACH_RE, "[attached file omitted from history — re-fetch it if you need the current content]");
   c = c.replace(ATTACH_RE_LEGACY, "[attached file omitted from history — re-fetch it if you need the current content]");
   c = c.replace(/!\[[^\]]*\]\(data:[^)]+\)/g, "[image omitted from history]");
-  if (c.length > limit) c = c.slice(0, limit) + "...[truncated]";
+  limit = Math.max(0, limit);
+  if (c.length > limit) {
+    const marker = "...[truncated]";
+    c = limit < marker.length ? c.slice(0, limit) : c.slice(0, limit - marker.length) + marker;
+  }
   return c;
 }
 
@@ -2151,7 +2162,8 @@ function buildHistoryForAgent(msgsArray, excludeLastN = 1) {
   const selected = [];
   let remaining = HISTORY_CHAR_BUDGET;
   for (const turn of turns.slice(-HISTORY_RECENT_TURNS).reverse()) {
-    const prepared = turn.map(m => ({ role: m.role, content: sanitizeForHistory(m.content, remaining) }));
+    const perMessageLimit = Math.min(2400, Math.floor(remaining / turn.length));
+    const prepared = turn.map(m => ({ role: m.role, content: sanitizeForHistory(m.content, perMessageLimit) }));
     const size = prepared.reduce((total, m) => total + m.content.length, 0);
     if (selected.length && size > remaining) break;
     selected.unshift(...prepared);
@@ -2298,16 +2310,41 @@ function resolveGhActionParams(action) {
   return out;
 }
 
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 60000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      data = { error: `Non-JSON response (HTTP ${res.status})` };
+    }
+    return { res, data };
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function apiErrorMessage(data, status) {
+  if (data && data.error && typeof data.error === "object" && data.error.message) return data.error.message;
+  if (data && typeof data.error === "string") return data.error;
+  return JSON.stringify(data || { error: `HTTP ${status}` });
+}
+
 async function runCode(language, code, stdin) {
-  const res = await fetch(CODE_EXEC_ENDPOINT, {
+  const { res, data } = await fetchJsonWithTimeout(CODE_EXEC_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ language, code, stdin }),
   });
-  const data = await res.json();
-  if (!res.ok) {
-    const msg = (data.error && data.error.message) ? data.error.message : JSON.stringify(data.error || data);
-    throw new Error(msg);
+  if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
+  if (!data || typeof data !== "object" || !data.data || typeof data.data !== "object") {
+    throw new Error("Code execution returned an invalid response");
   }
   return data.data;
 }
@@ -2385,12 +2422,16 @@ async function callProviders(agent, system, prompt, maxTokens, images, history) 
   for (const providerConfig of availableProviders(agent)) {
     const endpoint = PROVIDER_ENDPOINTS[providerConfig.provider];
     const r = await callAgentRaw(endpoint, providerConfig.model, system, prompt, maxTokens, images, history);
-    if (r.ok) {
+    const text = r.data && typeof r.data.content === "string" ? cleanThinking(r.data.content) : "";
+    if (r.ok && text.trim()) {
       noteProviderSuccess(providerConfig);
-      return { text: cleanThinking(r.data.content || ""), error: null };
+      return { text, error: null };
     }
-    noteProviderFailure(providerConfig, r.status);
-    lastError = { provider: providerConfig.provider, error: r.data };
+    // A successful HTTP response with no usable content is still a provider failure;
+    // otherwise the fallback chain would save an empty assistant message and stop.
+    const failureStatus = r.ok ? 502 : r.status;
+    noteProviderFailure(providerConfig, failureStatus);
+    lastError = { provider: providerConfig.provider, error: r.ok ? { error: "Provider returned no usable content" } : r.data };
   }
   return { text: null, error: lastError };
 }
@@ -2426,6 +2467,9 @@ async function callAgent(role, prompt, maxTokens = null, images = null, history 
       }
       return stripStrayToolTags(stepText); // final answer — no (valid) tool call
     }
+
+    // Preserve the separately supplied prompt before advancing to a tool result.
+    convo.push({ role: "user", content: currentPrompt });
 
     // ---- GitHub tool ----
     if (parsed.type === "gh") {
@@ -2523,26 +2567,28 @@ async function callAgent(role, prompt, maxTokens = null, images = null, history 
 function cleanThinking(text) {
   // Case 1: complete <think>...</think> pair — remove it
   let cleaned = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-  // Case 2: unclosed <think> tag (leaked/truncated reasoning) — strip from <think> onward
-  if (cleaned.includes("<think>") || text.trim().startsWith("<think>")) {
-    const idx = text.indexOf("<think>");
-    if (idx !== -1) {
-      const before = text.slice(0, idx).trim();
-      cleaned = before || "[Response was still reasoning when it ran out of room — try asking again, it usually completes fine on retry.]";
-    }
+  // Only tags left after removing complete pairs indicate truncated reasoning.
+  const idx = cleaned.indexOf("<think>");
+  if (idx !== -1) {
+    cleaned = cleaned.slice(0, idx).trim() || "[Response was still reasoning when it ran out of room — try asking again, it usually completes fine on retry.]";
   }
   return cleaned;
 }
 
 async function webSearch(query) {
-  const res = await fetch(TAVILY_ENDPOINT, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query })
-  });
-  const data = await res.json();
-  if (!res.ok || !data.results) return `[Search error] ${JSON.stringify(data)}`;
-  return data.results.map(r => `- ${r.title}: ${(r.content || "").slice(0, 200)}`).join("\n\n");
+  try {
+    const { res, data } = await fetchJsonWithTimeout(TAVILY_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query })
+    });
+    if (!res.ok || !data || !Array.isArray(data.results)) {
+      return `[Search error] ${apiErrorMessage(data, res.status)}`;
+    }
+    return data.results.map(r => `- ${r.title}: ${(r.content || "").slice(0, 200)}`).join("\n\n");
+  } catch (e) {
+    return `[Search error] ${e.message}`;
+  }
 }
 
 // ---------------- Routing ----------------
@@ -2646,7 +2692,12 @@ function updatePipeline(el, roles, activeIndex) {
 
 // ---------------- Rendering ----------------
 function escapeHtml(s) {
-  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  return String(s ?? "")
+    .replace(/&/g,"&amp;")
+    .replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;")
+    .replace(/'/g,"&#39;");
 }
 
 function formatContent(text) {
@@ -2949,6 +3000,7 @@ function copyMessage(wrap) {
 }
 
 async function regenerateMessage(wrap, msgId) {
+  if (rejectWhileSending() || !msgId) return;
   // Find the user message immediately before this assistant response
   const idx = messages.findIndex(m => m.id === msgId);
   let userTask = null;
@@ -2964,6 +3016,8 @@ async function regenerateMessage(wrap, msgId) {
   }
   if (!userTask) return;
 
+  isSending = true;
+  document.getElementById("sendBtn").disabled = true;
   const history = userTaskIdx >= 0 ? buildHistoryForAgent(messages.slice(0, userTaskIdx + 1), 1) : null;
 
   const bubble = wrap.querySelector(".bubble");
@@ -2990,6 +3044,9 @@ async function regenerateMessage(wrap, msgId) {
     if (mIdx !== -1) messages[mIdx].content = output;
   } catch (err) {
     bubble.innerHTML = "[Error] " + escapeHtml(String(err));
+  } finally {
+    isSending = false;
+    document.getElementById("sendBtn").disabled = false;
   }
 }
 
@@ -3013,9 +3070,10 @@ function startEdit(wrap, msgId, oldContent) {
 
 // ---------------- Conversation persistence ----------------
 async function loadConversations(uid) {
-  const { data } = await sb.from("conversations").select("*").eq("user_id", uid)
+  const { data, error } = await sb.from("conversations").select("*").eq("user_id", uid)
     .order("pinned", { ascending: false })
     .order("updated_at", { ascending: false });
+  if (error) throw new Error("Failed to load conversations: " + error.message);
   return data || [];
 }
 
@@ -3023,7 +3081,8 @@ async function loadConversations(uid) {
 let allProjects = [];
 
 async function loadProjects(uid) {
-  const { data } = await sb.from("projects").select("*").eq("user_id", uid).order("updated_at", { ascending: false });
+  const { data, error } = await sb.from("projects").select("*").eq("user_id", uid).order("updated_at", { ascending: false });
+  if (error) throw new Error("Failed to load projects: " + error.message);
   return data || [];
 }
 
@@ -3127,20 +3186,28 @@ document.getElementById("projectInstructionsSaveBtn").onclick = async () => {
 };
 
 document.getElementById("projectNewChatFab").onclick = async () => {
+  if (rejectWhileSending()) return;
   const proj = allProjects.find(p => p.id === currentDetailProjectId);
-  const conv = await createConversation(userId, "New chat");
-  await sb.from("conversations").update({ project_id: currentDetailProjectId }).eq("id", conv.id);
-  conv.project_id = currentDetailProjectId;
-  allConvs.unshift(conv);
-  currentProjectInstructions = proj ? proj.instructions : null;
-  document.getElementById("projectDetailView").style.display = "none";
-  document.getElementById("log").innerHTML = "";
-  messages = [];
-  currentConvId = conv.id;
-  currentBranchId = conv.active_branch_id;
-  document.getElementById("gateView").style.display = "none";
-  document.getElementById("chatView").style.display = "flex";
-  renderConvList(allConvs, currentConvId);
+  try {
+    const conv = await createConversation(userId, "New chat");
+    const { error } = await sb.from("conversations").update({ project_id: currentDetailProjectId }).eq("id", conv.id);
+    if (error) throw new Error("Failed to add new chat to project: " + error.message);
+    conv.project_id = currentDetailProjectId;
+    allConvs.unshift(conv);
+    currentProjectInstructions = proj ? proj.instructions : null;
+    document.getElementById("projectDetailView").style.display = "none";
+    document.getElementById("log").innerHTML = "";
+    messages = [];
+    versionMap = {};
+    clearReplyContext();
+    currentConvId = conv.id;
+    currentBranchId = conv.active_branch_id;
+    document.getElementById("gateView").style.display = "none";
+    document.getElementById("chatView").style.display = "flex";
+    renderConvList(allConvs, currentConvId);
+  } catch (e) {
+    showError(e.message);
+  }
 };
 
 document.getElementById("projectDeleteBtn").onclick = async () => {
@@ -3154,6 +3221,9 @@ document.getElementById("projectDeleteBtn").onclick = async () => {
   const delRes = await sb.from("projects").delete().eq("id", currentDetailProjectId);
   if (delRes.error) { showError("Failed to delete project: " + delRes.error.message); return; }
 
+  if (allConvs.some(c => c.id === currentConvId && c.project_id === currentDetailProjectId)) {
+    currentProjectInstructions = null;
+  }
   allConvs.forEach(c => { if (c.project_id === currentDetailProjectId) c.project_id = null; });
   allProjects = allProjects.filter(p => p.id !== currentDetailProjectId);
 
@@ -3190,6 +3260,9 @@ async function assignSelectedToProject(projectId) {
   if (error) { showError("Failed to add to project: " + error.message); return; }
 
   allConvs.forEach(c => { if (ids.includes(c.id)) c.project_id = projectId; });
+  if (ids.includes(currentConvId)) {
+    currentProjectInstructions = allProjects.find(p => p.id === projectId)?.instructions || null;
+  }
 
   document.getElementById("addToProjectOverlay").style.display = "none";
   chatsPageSelectMode = false;
@@ -3258,7 +3331,8 @@ let activeSkill = null;
 let editingSkillId = null;
 
 async function loadSkills(uid) {
-  const { data } = await sb.from("skills").select("*").eq("user_id", uid).order("updated_at", { ascending: false });
+  const { data, error } = await sb.from("skills").select("*").eq("user_id", uid).order("updated_at", { ascending: false });
+  if (error) throw new Error("Failed to load skills: " + error.message);
   return data || [];
 }
 
@@ -3373,7 +3447,7 @@ function showSkillPicker(anchorRect, filterQuery) {
     `).join("");
     popup.querySelectorAll(".skill-picker-item").forEach(item => {
       item.onclick = () => {
-        const skill = allSkills.find(s => s.id === parseInt(item.dataset.id));
+        const skill = allSkills.find(s => String(s.id) === item.dataset.id);
         if (skill) {
           setActiveSkill(skill);
           // If activated while typing "/query", clear that part from the input
@@ -3500,13 +3574,13 @@ document.getElementById("importSelectedSkillsBtn").onclick = async () => {
 
 // ---------------- Upload skills from .md / .zip ----------------
 function parseSkillMarkdown(content, fallbackName) {
-  const m = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
   if (!m) {
     return { name: fallbackName, instructions: content.trim() };
   }
   const [, frontmatter, body] = m;
   let name = fallbackName;
-  frontmatter.split("\n").forEach(line => {
+  frontmatter.split(/\r?\n/).forEach(line => {
     const idx = line.indexOf(":");
     if (idx === -1) return;
     const key = line.slice(0, idx).trim();
@@ -3623,7 +3697,10 @@ async function loadMessages(branchId) {
 }
 
 async function saveMessage(uid, convId, branchId, role, content) {
-  const { data, error } = await sb.from("chat_history").insert({ user_id: uid, conversation_id: convId, branch_id: branchId, role, content }).select().single();
+  // PostgreSQL text columns reject NUL bytes. Files and pasted text can contain one,
+  // so replace it before the insert rather than turning a valid send into a failed save.
+  const safeContent = String(content ?? "").replace(/\u0000/g, "\uFFFD");
+  const { data, error } = await sb.from("chat_history").insert({ user_id: uid, conversation_id: convId, branch_id: branchId, role, content: safeContent }).select().single();
   if (error) {
     // Previously this was swallowed silently (only `data` was read), so a failed insert
     // returned null and the caller's very next line — userMsg.id — crashed with no way to
@@ -3653,7 +3730,12 @@ async function forkBranch(convId, sourceBranchId, beforeMessageId) {
 
   if (priorMessages && priorMessages.length) {
     const copies = priorMessages.map(m => ({
-      user_id: m.user_id, conversation_id: convId, branch_id: newBranch.id, role: m.role, content: m.content
+      user_id: m.user_id,
+      conversation_id: convId,
+      branch_id: newBranch.id,
+      role: m.role,
+      content: m.content,
+      version_group: m.version_group || null,
     }));
     const { error: copyErr } = await sb.from("chat_history").insert(copies);
     if (copyErr) throw new Error("Failed to copy messages into new branch: " + copyErr.message);
@@ -3937,6 +4019,7 @@ function startRenameConversation(conv, anchorEl) {
 }
 
 async function deleteConversationById(conv) {
+  if (rejectWhileSending()) return false;
   // Break the circular reference (conversations.active_branch_id -> branches) before deleting branches
   const step1 = await sb.from("conversations").update({ active_branch_id: null }).eq("id", conv.id);
   if (step1.error) { showError("Delete failed (step 1): " + step1.error.message); return false; }
@@ -3978,6 +4061,7 @@ let currentBranchId = null;
 let conversationLoadEpoch = 0;
 
 async function openConversation(conv) {
+  if (rejectWhileSending()) return;
   const loadEpoch = ++conversationLoadEpoch;
   currentConvId = conv.id;
   currentBranchId = conv.active_branch_id;
@@ -3994,7 +4078,8 @@ async function openConversation(conv) {
       const { data: branch, error: branchErr } = await sb.from("branches").insert({ conversation_id: conv.id, parent_branch_id: null }).select().single();
       if (branchErr) throw new Error("Failed to create branch: " + branchErr.message);
       currentBranchId = branch.id;
-      await sb.from("conversations").update({ active_branch_id: currentBranchId }).eq("id", conv.id);
+      const { error: linkErr } = await sb.from("conversations").update({ active_branch_id: currentBranchId }).eq("id", conv.id);
+      if (linkErr) throw new Error("Failed to link branch to conversation: " + linkErr.message);
       conv.active_branch_id = currentBranchId;
     }
 
@@ -4015,22 +4100,32 @@ async function openConversation(conv) {
     messages = loadedMessages;
     versionMap = loadedVersionMap;
     await renderMessageBatch(messages);
-    if (window.innerWidth <= 768) toggleSidebar();
+    closeMobileSidebar();
   } catch (e) {
+    // A slower, older load must not overwrite the conversation the user selected later.
+    if (loadEpoch !== conversationLoadEpoch) return;
     showError("Couldn't open this conversation: " + e.message);
     document.getElementById("log").innerHTML = `<div class="msg assistant"><div class="bubble">Something went wrong loading this conversation. Try selecting it again.</div></div>`;
   }
 }
 
 async function startNewChat() {
-  const conv = await createConversation(userId, "New chat");
-  allConvs.unshift(conv);
-  renderConvList(allConvs, conv.id);
-  currentConvId = conv.id;
-  currentBranchId = conv.active_branch_id;
-  document.getElementById("log").innerHTML = "";
-  messages = [];
-  if (window.innerWidth <= 768) toggleSidebar();
+  if (rejectWhileSending()) return;
+  try {
+    const conv = await createConversation(userId, "New chat");
+    allConvs.unshift(conv);
+    renderConvList(allConvs, conv.id);
+    currentConvId = conv.id;
+    currentBranchId = conv.active_branch_id;
+    document.getElementById("log").innerHTML = "";
+    messages = [];
+    versionMap = {};
+    currentProjectInstructions = null;
+    clearReplyContext();
+    closeMobileSidebar();
+  } catch (e) {
+    showError("Couldn't start a new chat: " + e.message);
+  }
 }
 
 // ---------------- Flow control ----------------
@@ -4322,6 +4417,12 @@ document.getElementById("fileInput").addEventListener("change", (e) => {
 // send button while the second was still running. Now a second call is simply ignored
 // (the typed text is left in the box, not lost) until the first finishes.
 let isSending = false;
+function rejectWhileSending() {
+  if (!isSending) return false;
+  showInfo("Please wait for the current response to finish before switching chats or editing it.");
+  return true;
+}
+
 async function sendTask() {
   if (isSending) return;
   isSending = true;
@@ -4339,6 +4440,11 @@ async function sendTaskInner() {
   const input = document.getElementById("taskInput");
   let typed = input.value.trim();
   if ((!typed && !attachedFiles.length) || !userId || !currentConvId) return;
+  // Keep the destination stable while the provider is working. The user may switch
+  // conversations before the response arrives; it must still be saved to the chat that
+  // originated the request, not whichever chat happens to be open at completion time.
+  const targetConvId = currentConvId;
+  const targetBranchId = currentBranchId;
   input.value = "";
   hideSkillPicker();
   document.getElementById("sendBtn").disabled = true;
@@ -4408,23 +4514,30 @@ async function sendTaskInner() {
   // guaranteed to come back to a usable state in the `finally` block.
   try {
     // `task` (full, untruncated) is what's saved to the DB and shown in the UI.
-    const userMsg = await saveMessage(userId, currentConvId, currentBranchId, "user", task);
-    addMessage("user", task, null, userMsg.id);
-    messages.push(userMsg);
+    const userMsg = await saveMessage(userId, targetConvId, targetBranchId, "user", task);
+    const responseMessages = [...messages, userMsg];
+    if (currentConvId === targetConvId && currentBranchId === targetBranchId) {
+      addMessage("user", task, null, userMsg.id);
+      messages.push(userMsg);
+    }
 
     // Auto-title the conversation from the first message
-    const conv = allConvs.find(c => c.id === currentConvId);
+    const conv = allConvs.find(c => c.id === targetConvId);
     if (conv && conv.title === "New chat") {
       const title = typed.length > 40 ? typed.slice(0, 40) + "…" : (typed || "New chat");
       conv.title = title;
       renderConvList(allConvs, currentConvId);
-      await touchConversation(currentConvId, title);
+      await touchConversation(targetConvId, title);
     } else {
-      await touchConversation(currentConvId);
+      await touchConversation(targetConvId);
     }
 
     // `modelTask` (possibly truncated for oversized files) is what's actually sent to the agent.
-    await runAndSaveResponse(modelTask, imageDataUrls.length ? { images: imageDataUrls, question: typed } : null);
+    await runAndSaveResponse(modelTask, imageDataUrls.length ? { images: imageDataUrls, question: modelTask.replace(/!\[[^\]]*\]\(data:[^)]+\)/g, "").trim() } : null, {
+      convId: targetConvId,
+      branchId: targetBranchId,
+      messages: responseMessages
+    });
   } catch (e) {
     showError("Message failed to send: " + e.message);
   } finally {
@@ -4489,15 +4602,25 @@ selectionBtn.onclick = () => {
   window.getSelection().removeAllRanges();
 };
 
-async function runAndSaveResponse(task, visionData = null) {
-  const thinkingWrap = addMessage("assistant", "");
-  const bubble = thinkingWrap.querySelector(".bubble");
+async function runAndSaveResponse(task, visionData = null, target = null) {
+  const targetConvId = target && target.convId != null ? target.convId : currentConvId;
+  const targetBranchId = target && target.branchId != null ? target.branchId : currentBranchId;
+  const isTargetOpen = () => currentConvId === targetConvId && currentBranchId === targetBranchId;
+
+  // Do not append a response from an old request to whatever conversation is currently open.
+  // The response is still persisted below, but its live placeholder is only created when the
+  // originating conversation is visible.
+  const thinkingWrap = isTargetOpen() ? addMessage("assistant", "") : null;
+  const bubble = thinkingWrap ? thinkingWrap.querySelector(".bubble") : null;
   const traceEl = document.createElement("div");
   traceEl.className = "pipeline";
-  thinkingWrap.insertBefore(traceEl, bubble);
-  bubble.innerHTML = `<span class="thinking">processing</span>`;
+  if (thinkingWrap) {
+    thinkingWrap.insertBefore(traceEl, bubble);
+    bubble.innerHTML = `<span class="thinking">processing</span>`;
+  }
 
-  const history = buildHistoryForAgent(messages, 1); // exclude the message we just sent (passed as prompt)
+  const requestMessages = target && Array.isArray(target.messages) ? target.messages : messages;
+  const history = buildHistoryForAgent(requestMessages, 1); // exclude the message we just sent (passed as prompt)
 
   try {
     let output, role;
@@ -4512,21 +4635,25 @@ async function runAndSaveResponse(task, visionData = null) {
       output = res.result; role = res.role;
     }
 
-    thinkingWrap.querySelector(".msg-tag") || (() => {
-      const tagEl = document.createElement("div");
-      tagEl.className = "msg-tag";
-      tagEl.textContent = role === "multi-step" ? "multi-step" : role;
-      thinkingWrap.insertBefore(tagEl, traceEl);
-    })();
+    if (thinkingWrap && isTargetOpen()) {
+      thinkingWrap.querySelector(".msg-tag") || (() => {
+        const tagEl = document.createElement("div");
+        tagEl.className = "msg-tag";
+        tagEl.textContent = role === "multi-step" ? "multi-step" : role;
+        thinkingWrap.insertBefore(tagEl, traceEl);
+      })();
+      bubble.innerHTML = formatContent(output);
+      document.getElementById("log").scrollTop = document.getElementById("log").scrollHeight;
+    }
 
-    bubble.innerHTML = formatContent(output);
-    document.getElementById("log").scrollTop = document.getElementById("log").scrollHeight;
-
-    const savedMsg = await saveMessage(userId, currentConvId, currentBranchId, "assistant", output);
-    bindMessageId(thinkingWrap, savedMsg.id);
-    messages.push(savedMsg);
+    const savedMsg = await saveMessage(userId, targetConvId, targetBranchId, "assistant", output);
+    if (thinkingWrap && isTargetOpen()) {
+      bindMessageId(thinkingWrap, savedMsg.id);
+      messages.push(savedMsg);
+    }
   } catch (err) {
-    bubble.innerHTML = "[Error] " + escapeHtml(String(err));
+    if (bubble && isTargetOpen()) bubble.innerHTML = "[Error] " + escapeHtml(String(err));
+    else showError("Response failed: " + err.message);
   }
 }
 
@@ -4536,7 +4663,8 @@ let versionMap = {};
 async function buildVersionMap(msgs) {
   const groups = [...new Set(msgs.filter(m => m.version_group).map(m => m.version_group))];
   if (!groups.length) return {};
-  const { data } = await sb.from("chat_history").select("id,branch_id,version_group").in("version_group", groups).order("id");
+  const { data, error } = await sb.from("chat_history").select("id,branch_id,version_group").in("version_group", groups).order("id");
+  if (error) throw new Error("Failed to load message versions: " + error.message);
   const map = {};
   (data || []).forEach(row => {
     if (!map[row.version_group]) map[row.version_group] = [];
@@ -4587,6 +4715,7 @@ function setupVersionSwitcher(wrap, group, currentMsgId) {
 }
 
 async function switchVersion(targetBranchId) {
+  if (rejectWhileSending()) return;
   // Same risk as openConversation: this clears and rebuilds the whole log, and was
   // completely unguarded — a failure here (a bad row, a network blip) left the log blank
   // with no error and no way back short of a reload.
@@ -4610,7 +4739,9 @@ async function switchVersion(targetBranchId) {
 }
 
 async function submitEdit(wrap, msgId, newContent) {
-  if (!newContent) return;
+  if (rejectWhileSending() || !newContent) return;
+  isSending = true;
+  document.getElementById("sendBtn").disabled = true;
 
   try {
     let m = messages.find(x => x.id === msgId);
@@ -4641,6 +4772,9 @@ async function submitEdit(wrap, msgId, newContent) {
     await runAndSaveResponse(newContent);
   } catch (e) {
     showError("Couldn't save your edit: " + e.message);
+  } finally {
+    isSending = false;
+    document.getElementById("sendBtn").disabled = false;
   }
 }
 
@@ -4655,15 +4789,14 @@ document.getElementById("taskInput").addEventListener("keydown", e => {
 // ==================== GitHub integration ====================
 
 async function ghCall(action, params = {}) {
-  const res = await fetch(GITHUB_ENDPOINT, {
+  const { res, data } = await fetchJsonWithTimeout(GITHUB_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action, ...params }),
   });
-  const data = await res.json();
-  if (!res.ok) {
-    const msg = (data.error && data.error.message) ? data.error.message : JSON.stringify(data.error || data);
-    throw new Error(msg);
+  if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
+  if (!data || typeof data !== "object" || !("data" in data)) {
+    throw new Error("GitHub service returned an invalid response");
   }
   return data.data;
 }
