@@ -1979,14 +1979,14 @@ if (window.innerWidth <= 768) {
 // Supabase password auth uses an email identifier. The UI keeps the requested
 // username, while this fixed internal email identifies the one allowed account.
 const LOGIN_USERNAME = "anu";
-const LOGIN_EMAIL = "anu@example.com";
+const LOGIN_EMAIL = "anudelu07@gmail.com";
 
 async function attemptLogin() {
   const username = document.getElementById("gateInput").value.trim();
   const password = document.getElementById("gatePassword").value;
   const error = document.getElementById("gateError");
   const button = document.getElementById("gateBtn");
-  if (username !== LOGIN_USERNAME) {
+  if (username !== LOGIN_USERNAME && username !== LOGIN_EMAIL) {
     error.textContent = "Invalid username or password.";
     return;
   }
