@@ -1590,11 +1590,13 @@
 
     <div id="gateView" class="gate">
       <div class="gate-box">
-        ENTER AN ID TO START<br>
-        <span style="color:var(--text-dim); font-size:11px;">Same ID loads your history on any device.</span>
+        SIGN IN TO START<br>
+        <span style="color:var(--text-dim); font-size:11px;">Private temporary access for this deployment.</span>
       </div>
-      <input type="text" id="gateInput" placeholder="e.g. anuj">
-      <button id="gateBtn">Connect</button>
+      <input type="text" id="gateInput" placeholder="Username" autocomplete="username">
+      <input type="password" id="gatePassword" placeholder="Password" autocomplete="current-password">
+      <div id="gateError" style="color:var(--error); font-family:var(--mono); font-size:11px; min-height:16px;"></div>
+      <button id="gateBtn">Sign in</button>
     </div>
 
     <div id="chatView" style="display:none; flex:1; flex-direction:column; min-height:0;">
@@ -1973,9 +1975,45 @@ if (window.innerWidth <= 768) {
   sidebar.classList.add("collapsed");
 }
 
-// ---------------- Bind buttons FIRST, before anything risky ----------------
-document.getElementById("gateBtn").onclick = () => connect(document.getElementById("gateInput").value);
-document.getElementById("gateInput").addEventListener("keydown", e => { if (e.key === "Enter" && !e.isComposing && e.keyCode !== 229) connect(e.target.value); });
+// ---------------- Supabase Auth gate ----------------
+// Supabase password auth uses an email identifier. The UI keeps the requested
+// username, while this fixed internal email identifies the one allowed account.
+const LOGIN_USERNAME = "anu";
+const LOGIN_EMAIL = "anu@example.com";
+
+async function attemptLogin() {
+  const username = document.getElementById("gateInput").value.trim();
+  const password = document.getElementById("gatePassword").value;
+  const error = document.getElementById("gateError");
+  const button = document.getElementById("gateBtn");
+  if (username !== LOGIN_USERNAME) {
+    error.textContent = "Invalid username or password.";
+    return;
+  }
+  error.textContent = "Signing in…";
+  button.disabled = true;
+  try {
+    if (!sb) throw new Error("Supabase is not available.");
+    const { data, error: authError } = await sb.auth.signInWithPassword({
+      email: LOGIN_EMAIL,
+      password,
+    });
+    if (authError) throw authError;
+    error.textContent = "";
+    await connect(username, data.user);
+  } catch (e) {
+    error.textContent = "Invalid username or password.";
+  } finally {
+    button.disabled = false;
+  }
+}
+
+document.getElementById("gateBtn").onclick = attemptLogin;
+["gateInput", "gatePassword"].forEach(id => {
+  document.getElementById(id).addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.isComposing && e.keyCode !== 229) attemptLogin();
+  });
+});
 
 // ---------------- Defensive error handling ----------------
 function showError(msg) {
@@ -4129,8 +4167,12 @@ async function startNewChat() {
 }
 
 // ---------------- Flow control ----------------
-async function connect(uid) {
+async function connect(uid, authUser) {
   try {
+    if (uid !== LOGIN_USERNAME || !authUser) {
+      showError("Authentication failed.");
+      return;
+    }
     userId = uid.trim();
     if (!userId) return;
     document.getElementById("gateView").style.display = "none";
