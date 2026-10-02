@@ -1571,6 +1571,7 @@
         <span class="footer-username" id="footerUsername"></span>
       </button>
       <button id="newChatBtn" class="new-chat-btn-footer" style="display:none;">+ New chat</button>
+      <button id="logoutBtn" class="topbar-icon-btn" style="display:none;" title="Sign out">↪</button>
     </div>
   </div>
 
@@ -1590,13 +1591,15 @@
 
     <div id="gateView" class="gate">
       <div class="gate-box">
-        SIGN IN TO START<br>
-        <span style="color:var(--text-dim); font-size:11px;">Private temporary access for this deployment.</span>
+        <div style="font-size:28px; color:var(--accent); margin-bottom:10px;">◈</div>
+        <strong style="color:var(--text); font-size:20px;">Quorum</strong><br>
+        SIGN IN TO YOUR WORKSPACE<br>
+        <span style="color:var(--text-dim); font-size:11px;">Private personal workspace</span>
       </div>
-      <input type="text" id="gateInput" placeholder="Username" autocomplete="username">
-      <input type="password" id="gatePassword" placeholder="Password" autocomplete="current-password">
-      <div id="gateError" style="color:var(--error); font-family:var(--mono); font-size:11px; min-height:16px;"></div>
-      <button id="gateBtn">Sign in</button>
+      <input type="text" id="gateInput" placeholder="Username" autocomplete="username" aria-label="Username">
+      <input type="password" id="gatePassword" placeholder="Password" autocomplete="current-password" aria-label="Password">
+      <div id="gateError" role="alert" style="color:var(--error); font-family:var(--mono); font-size:11px; min-height:16px;"></div>
+      <button id="gateBtn">Sign in securely</button>
     </div>
 
     <div id="chatView" style="display:none; flex:1; flex-direction:column; min-height:0;">
@@ -2374,10 +2377,16 @@ function apiErrorMessage(data, status) {
   return JSON.stringify(data || { error: `HTTP ${status}` });
 }
 
+async function getAuthHeaders() {
+  const { data, error } = await sb.auth.getSession();
+  if (error || !data.session) throw new Error("Your session has expired. Please sign in again.");
+  return { "Content-Type": "application/json", Authorization: `Bearer ${data.session.access_token}` };
+}
+
 async function runCode(language, code, stdin) {
   const { res, data } = await fetchJsonWithTimeout(CODE_EXEC_ENDPOINT, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: await getAuthHeaders(),
     body: JSON.stringify({ language, code, stdin }),
   });
   if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
@@ -2415,7 +2424,7 @@ async function callAgentRaw(endpoint, model, system, prompt, maxTokens, images, 
   try {
     const res = await fetch(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: await getAuthHeaders(),
       body: JSON.stringify(body),
       signal: controller.signal
     });
@@ -2615,9 +2624,9 @@ function cleanThinking(text) {
 
 async function webSearch(query) {
   try {
-    const { res, data } = await fetchJsonWithTimeout(TAVILY_ENDPOINT, {
+      const { res, data } = await fetchJsonWithTimeout(TAVILY_ENDPOINT, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: await getAuthHeaders(),
       body: JSON.stringify({ query })
     });
     if (!res.ok || !data || !Array.isArray(data.results)) {
@@ -4192,6 +4201,7 @@ async function connect(uid, authUser) {
     document.getElementById("skillsBtn").style.display = "flex";
     document.getElementById("githubBtn").style.display = "flex";
     document.getElementById("sandboxBtn").style.display = "flex";
+    document.getElementById("logoutBtn").style.display = "flex";
 
     allProjects = await loadProjects(userId);
     allSkills = await loadSkills(userId);
@@ -4210,6 +4220,11 @@ async function connect(uid, authUser) {
 
 document.getElementById("newChatBtn").onclick = startNewChat;
 document.getElementById("topbarNewChatBtn").onclick = startNewChat;
+document.getElementById("logoutBtn").onclick = async () => {
+  if (isSending) return showInfo("Please wait for the current response to finish.");
+  await sb.auth.signOut();
+  window.location.reload();
+};
 document.getElementById("topbarArtifactsBtn").onclick = openCurrentChatArtifacts;
 
 // ---------------- Artifacts (code blocks extracted from messages) ----------------
@@ -4833,7 +4848,7 @@ document.getElementById("taskInput").addEventListener("keydown", e => {
 async function ghCall(action, params = {}) {
   const { res, data } = await fetchJsonWithTimeout(GITHUB_ENDPOINT, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: await getAuthHeaders(),
     body: JSON.stringify({ action, ...params }),
   });
   if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
