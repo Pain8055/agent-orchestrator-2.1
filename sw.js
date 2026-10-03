@@ -1,6 +1,6 @@
 // Scope the cache to this deployment; other apps may share the same origin.
 const CACHE_PREFIX = `agent-team-shell:${self.registration.scope}:`;
-const CACHE_NAME = CACHE_PREFIX + 'v2';
+const CACHE_NAME = CACHE_PREFIX + 'v3';
 const APP_SHELL = ['./', './index.html', './manifest.json'].map(path => new URL(path, self.registration.scope).href);
 
 self.addEventListener('install', event => {
