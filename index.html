@@ -12,8 +12,10 @@
 <meta name="apple-mobile-web-app-title" content="Quorum">
 <title>Agent Team</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"></noscript>
+<script src="vendor/supabase-js-2.117.2.js"></script>
 <style>
   :root {
     --bg: #17140F;
@@ -2107,7 +2109,13 @@ function loadOptionalScript(globalName, url) {
 
 // ---------------- PWA: register the service worker ----------------
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js').catch(() => {}); // fail silently if unsupported
+  // Installing the offline shell fetches the HTML and library again. Don't let those
+  // background downloads compete with the first paint or sign-in on slow connections.
+  window.addEventListener('load', () => {
+    const register = () => navigator.serviceWorker.register('sw.js').catch(() => {});
+    if ('requestIdleCallback' in window) requestIdleCallback(register, { timeout: 3000 });
+    else setTimeout(register, 1000);
+  });
 }
 
 // ---------------- Real viewport height fix (mobile browser chrome bug) ----------------
@@ -4576,10 +4584,12 @@ async function connect(uid, authUser) {
     document.getElementById("sandboxBtn").style.display = "flex";
     document.getElementById("logoutBtn").style.display = "flex";
 
-    allProjects = await loadProjects(userId);
-    allSkills = await loadSkills(userId);
-
-    allConvs = await loadConversations(userId);
+    // These reads do not depend on one another. Fetch together rather than making
+    // tablet users wait for three network round trips before the chat can open.
+    chatLog.innerHTML = `<div class="chat-loading" role="status" aria-label="Loading workspace"><div class="response-skeleton"><span></span><span></span><span></span></div></div>`;
+    [allProjects, allSkills, allConvs] = await Promise.all([
+      loadProjects(userId), loadSkills(userId), loadConversations(userId)
+    ]);
     if (allConvs.length === 0) {
       const conv = await createConversation(userId, "New chat");
       allConvs = [conv];
@@ -4588,6 +4598,9 @@ async function connect(uid, authUser) {
     await openConversation(allConvs[0]);
   } catch (e) {
     showError("Connect failed: " + e.message);
+    document.getElementById("gateError").textContent = "Couldn't load the workspace. Check your connection and try again.";
+    document.getElementById("chatView").style.display = "none";
+    document.getElementById("gateView").style.display = "flex";
   }
 }
 

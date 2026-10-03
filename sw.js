@@ -1,11 +1,14 @@
 // Scope the cache to this deployment; other apps may share the same origin.
 const CACHE_PREFIX = `agent-team-shell:${self.registration.scope}:`;
-const CACHE_NAME = CACHE_PREFIX + 'v3';
-const APP_SHELL = ['./', './index.html', './manifest.json'].map(path => new URL(path, self.registration.scope).href);
+const CACHE_NAME = CACHE_PREFIX + 'v4';
+const APP_SHELL = ['./', './index.html', './manifest.json', './vendor/supabase-js-2.117.2.js']
+  .map(path => new URL(path, self.registration.scope).href);
 
 self.addEventListener('install', event => {
+  // The root and index URL serve the same HTML. Cache only index during install
+  // so first-time visitors don't download the full document twice in the background.
   event.waitUntil(caches.open(CACHE_NAME)
-    .then(cache => cache.addAll(APP_SHELL))
+    .then(cache => cache.addAll(APP_SHELL.slice(1)))
     .then(() => self.skipWaiting()));
 });
 
