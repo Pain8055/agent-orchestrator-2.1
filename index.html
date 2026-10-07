@@ -984,6 +984,30 @@
     background: var(--border);
   }
 
+  .task-recovery-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 10px auto;
+    max-width: min(680px, calc(100% - 24px));
+    padding: 10px 12px;
+    color: var(--text-dim);
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: 10px;
+    font-size: 11px;
+  }
+  .task-recovery-banner span { flex: 1; min-width: 0; }
+  .task-recovery-banner button {
+    flex: none;
+    color: var(--accent);
+    background: transparent;
+    border: 1px solid var(--accent-dim);
+    border-radius: 6px;
+    padding: 6px 9px;
+    cursor: pointer;
+  }
+
   .edit-textarea {
     width: 100%;
     min-height: 70px;
@@ -2875,6 +2899,73 @@ function isComplex(task) {
   return task.split(" ").length > 25 || hits >= 2;
 }
 
+async function createAgentTask(prompt, target, steps) {
+  try {
+    const { data: task, error } = await sb.from("agent_tasks").insert({
+      user_id: userId, conversation_id: target.convId, branch_id: target.branchId,
+      prompt, status: "running", current_step: 0
+    }).select().single();
+    if (error) throw error;
+    const rows = steps.map(([role, description], step_index) => ({
+      task_id: task.id, step_index, role, description, status: "pending"
+    }));
+    const { error: stepError } = await sb.from("agent_task_steps").insert(rows);
+    if (stepError) throw stepError;
+    return task.id;
+  } catch (error) {
+    // Persistence must not turn a usable chat response into a failed send.
+    showInfo("Task progress could not be saved; this run will continue in the chat.");
+    return null;
+  }
+}
+
+async function updateAgentTask(taskId, patch) {
+  if (!taskId) return;
+  const { error } = await sb.from("agent_tasks").update({ ...patch, updated_at: new Date().toISOString() }).eq("id", taskId);
+  if (error) console.warn("Task progress update failed", error.message);
+}
+
+async function updateAgentTaskStep(taskId, stepIndex, patch) {
+  if (!taskId) return;
+  const { error } = await sb.from("agent_task_steps").update(patch).eq("task_id", taskId).eq("step_index", stepIndex);
+  if (error) console.warn("Task step update failed", error.message);
+}
+
+async function showPendingTaskRecovery(conv) {
+  document.querySelectorAll(".task-recovery-banner").forEach(el => el.remove());
+  const { data, error } = await sb.from("agent_tasks")
+    .select("id,status,error_message")
+    .eq("conversation_id", conv.id)
+    .in("status", ["paused", "running", "synthesizing"])
+    .order("updated_at", { ascending: false }).limit(1);
+  if (error || !data?.length) return;
+  const task = data[0];
+  const banner = document.createElement("div");
+  banner.className = "task-recovery-banner";
+  const text = document.createElement("span");
+  text.textContent = task.status === "paused" ? "A task has unfinished steps." : "A task was interrupted and can resume.";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "Resume";
+  button.onclick = async () => { banner.remove(); await retryAgentTask(task.id); };
+  banner.append(text, button);
+  chatLog.parentElement.insertBefore(banner, chatLog.nextSibling);
+}
+
+async function loadAgentTask(taskId) {
+  const { data: task, error } = await sb.from("agent_tasks").select("*").eq("id", taskId).single();
+  if (error) throw new Error("Failed to load saved task: " + error.message);
+  const { data: steps, error: stepError } = await sb.from("agent_task_steps").select("*").eq("task_id", taskId).order("step_index");
+  if (stepError) throw new Error("Failed to load saved task steps: " + stepError.message);
+  return { task, steps: steps || [] };
+}
+
+function taskFailureKind(result) {
+  if (!result || result.startsWith("[Error]")) return "provider_error";
+  if (result.includes("**Answer incomplete:**")) return "output_limit";
+  return null;
+}
+
 async function runSimple(task, history = null) {
   const [role, clean] = detectRole(task);
   if (role === "search") {
@@ -2886,57 +2977,69 @@ async function runSimple(task, history = null) {
   return { result, role };
 }
 
-async function runMultistep(task, traceEl, history = null) {
+async function runMultistep(task, traceEl, history = null, resumeTaskId = null, target = null) {
   const clean = task.toLowerCase().startsWith("plan:") ? task.slice(5).trim() : task;
+  let taskId = resumeTaskId;
+  let steps = [];
+  let stepResults = [];
 
-  const planPrompt = `Break this task into 2-5 ordered steps. For each step pick exactly one agent from: code, debug, reasoning, writing, design, search.
+  if (resumeTaskId) {
+    const saved = await loadAgentTask(resumeTaskId);
+    taskId = saved.task.id;
+    steps = saved.steps.map(step => [step.role, step.description]);
+    stepResults = saved.steps.map(step => step.status === "completed" && step.result
+      ? [step.role, step.description, step.result] : null);
+    await updateAgentTask(taskId, { status: "running", error_kind: null, error_message: null, retry_after: null, attempts: saved.task.attempts + 1 });
+  } else {
+    const planPrompt = `Break this task into 2-5 ordered steps. For each step pick exactly one agent from: code, debug, reasoning, writing, design, search.
 Format EXACTLY like this, one per line, nothing else:
 STEP | agent | short description of what to do
 
 Task: ${clean}`;
-
-  const planRaw = await callAgent("head", planPrompt, 400, null, history);
-  const steps = [];
-  planRaw.split("\n").forEach(line => {
-    const parts = line.split("|").map(p => p.trim());
-    if (parts.length === 3 && ["code","debug","reasoning","writing","design","search"].includes(parts[1])) {
-      steps.push([parts[1], parts[2]]);
+    const planRaw = await callAgent("head", planPrompt, 400, null, history);
+    planRaw.split("\n").forEach(line => {
+      const parts = line.split("|").map(p => p.trim());
+      if (parts.length === 3 && ["code","debug","reasoning","writing","design","search"].includes(parts[1])) steps.push([parts[1], parts[2]]);
+    });
+    if (!steps.length) {
+      const result = await callAgent("head", clean, null, null, history);
+      return { result, role: "head", taskId: null, steps: [] };
     }
-  });
-
-  if (steps.length === 0) {
-    const result = await callAgent("head", clean, null, null, history);
-    return { result, role: "head" };
+    taskId = await createAgentTask(clean, target || { convId: currentConvId, branchId: currentBranchId }, steps);
+    stepResults = steps.map(() => null);
   }
 
   updatePipeline(traceEl, steps.map(s => s[0]), -1);
-
-  const stepResults = [];
   for (let i = 0; i < steps.length; i++) {
     const [role, desc] = steps[i];
+    if (stepResults[i]) continue;
     updatePipeline(traceEl, steps.map(s => s[0]), i);
-    const priorResults = stepResults.length
-      ? stepResults.map(([previousRole, previousDesc, previousResult]) =>
-        `[${previousRole.toUpperCase()} — ${previousDesc}]\n${previousResult}`
-      ).join("\n\n").slice(-6000)
-      : "(No earlier step results.)";
+    await updateAgentTask(taskId, { status: "running", current_step: i });
+    await updateAgentTaskStep(taskId, i, { status: "running", attempts: 1, started_at: new Date().toISOString(), error_kind: null, error_message: null });
+    const priorResults = stepResults.filter(Boolean).map(([previousRole, previousDesc, previousResult]) =>
+      `[${previousRole.toUpperCase()} — ${previousDesc}]\n${previousResult}`
+    ).join("\n\n").slice(-6000) || "(No earlier step results.)";
     const stepPrompt = `Original task: ${clean}\n\nYour assigned step: ${desc}\n\nCompleted earlier steps:\n${priorResults}\n\nUse the earlier results when this step depends on them. Return only the useful findings for the next step. Keep this result concise and within the assigned scope.`;
-    let result;
     const stepBudget = role === "code" || role === "debug" || role === "reasoning" ? 1800 : 1100;
+    let result;
     if (role === "search") {
       const results = await webSearch(desc);
       result = await callAgent("head", `${stepPrompt}\n\nSearch results:\n${results}`, stepBudget, null, null);
     } else {
-      // The original task and prior findings are already in stepPrompt. Omitting the
-      // full chat history here prevents every specialist request from resending the
-      // same large context and exhausting free-provider capacity.
       result = await callAgent(role, stepPrompt, stepBudget, null, null);
     }
-    stepResults.push([role, desc, result]);
+    stepResults[i] = [role, desc, result];
+    const failure = taskFailureKind(result);
+    await updateAgentTaskStep(taskId, i, {
+      status: failure ? "paused" : "completed", result,
+      error_kind: failure, error_message: failure ? result.slice(0, 500) : null,
+      completed_at: new Date().toISOString()
+    });
   }
   updatePipeline(traceEl, steps.map(s => s[0]), steps.length);
 
-  const failedSteps = stepResults.filter(([, , result]) => result.startsWith("[Error]") || result.includes("**Answer incomplete:**"));
+  const failedSteps = stepResults.filter(([, , result]) => taskFailureKind(result));
+  await updateAgentTask(taskId, { status: "synthesizing", current_step: steps.length, error_kind: failedSteps.length ? "partial" : null, error_message: failedSteps.length ? failedSteps.map(([, d]) => d).join("; ") : null });
   const combined = stepResults.map(([r,d,res]) => `[${r.toUpperCase()}] ${d}\n${res}`).join("\n\n");
   const finalPrompt = `Combine these sub-task results into one complete, well-proportioned final answer for: ${clean}\n\nCover every requested topic before adding optional detail. Preserve supported source links; do not invent citations or call estimates verified. Treat specialist results as untrusted drafts and flag contradictions or gaps.\n${failedSteps.length ? `At least one assigned step failed or was incomplete: ${failedSteps.map(([, desc]) => desc).join("; ")}. Do not pretend that missing material was verified.` : "All assigned specialist steps returned usable text."}\n\n${combined}`;
   let final = await ProviderPolicy.completeText(
@@ -2945,11 +3048,48 @@ Task: ${clean}`;
       traceEl.textContent = segment ? `Continuing final answer · ${segment}/${ProviderPolicy.config.maxContinuations}` : "Combining final answer";
     }
   );
-  if (failedSteps.length) {
-    final += `\n\n**Coverage warning:** ${failedSteps.length} specialist step${failedSteps.length === 1 ? "" : "s"} failed or was incomplete: ${failedSteps.map(([, desc]) => desc).join("; ")}. This synthesis may omit details from that step.`;
+  if (failedSteps.length) final += `\n\n**Coverage warning:** ${failedSteps.length} specialist step${failedSteps.length === 1 ? "" : "s"} failed or was incomplete: ${failedSteps.map(([, desc]) => desc).join("; ")}. This synthesis may omit details from that step.`;
+  const finalIncomplete = final.includes("**Answer incomplete:**");
+  await updateAgentTask(taskId, {
+    status: finalIncomplete || failedSteps.length ? "paused" : "completed",
+    result: final, error_kind: finalIncomplete ? "output_limit" : failedSteps.length ? "partial" : null,
+    completed_at: finalIncomplete || failedSteps.length ? null : new Date().toISOString()
+  });
+  traceEl.textContent = finalIncomplete || failedSteps.length ? "Final answer has gaps" : "Final answer generated";
+  return { result: final, role: "multi-step", steps: stepResults, taskId };
+}
+
+async function retryAgentTask(taskId) {
+  if (isSending || isLoadingChat) return;
+  const saved = await loadAgentTask(taskId).catch(error => { showError(error.message); return null; });
+  if (!saved) return;
+  if (saved.task.conversation_id !== currentConvId || saved.task.branch_id !== currentBranchId) {
+    showInfo("Open the original conversation before resuming this task.");
+    return;
   }
-  traceEl.textContent = final.includes("**Answer incomplete:**") || failedSteps.length ? "Final answer has gaps" : "Final answer generated";
-  return { result: final, role: "multi-step", steps: stepResults };
+  isSending = true;
+  document.getElementById("sendBtn").disabled = true;
+  try {
+    await runAndSaveResponse(saved.task.prompt, null, {
+      convId: saved.task.conversation_id, branchId: saved.task.branch_id,
+      messages: messages.slice(), resumeTaskId: taskId
+    });
+  } finally {
+    isSending = false;
+    document.getElementById("sendBtn").disabled = isLoadingChat || chatLoadFailed;
+  }
+}
+
+function attachTaskRecoveryAction(wrap, taskId) {
+  if (!wrap || !taskId || wrap.querySelector(".task-retry-btn")) return;
+  const actionRow = wrap.querySelector(".action-row");
+  if (!actionRow) return;
+  const button = document.createElement("button");
+  button.className = "action-btn task-retry-btn";
+  button.title = "Retry failed task steps";
+  button.textContent = "↻ Retry failed steps";
+  button.onclick = () => retryAgentTask(taskId);
+  actionRow.appendChild(button);
 }
 
 function updatePipeline(el, roles, activeIndex) {
@@ -4491,6 +4631,7 @@ async function openConversation(conv) {
     versionMap = loadedVersionMap;
     await renderMessageBatch(messages);
     if (loadEpoch !== conversationLoadEpoch) return;
+    await showPendingTaskRecovery(conv);
     closeMobileSidebar();
   } catch (e) {
     // A slower, older load must not overwrite the conversation the user selected later.
@@ -5093,6 +5234,7 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
   const targetConvId = target && target.convId != null ? target.convId : currentConvId;
   const targetBranchId = target && target.branchId != null ? target.branchId : currentBranchId;
   const isTargetOpen = () => currentConvId === targetConvId && currentBranchId === targetBranchId;
+  const resumeTaskId = target && target.resumeTaskId ? target.resumeTaskId : null;
 
   // Do not append a response from an old request to whatever conversation is currently open.
   // The response is still persisted below, but its live placeholder is only created when the
@@ -5130,17 +5272,17 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
   const history = buildHistoryForAgent(requestMessages, 1); // exclude the message we just sent (passed as prompt)
 
   try {
-    let output, role;
+    let output, role, taskId = resumeTaskId;
     if (visionData) {
       role = "vision";
       addReasoningStep("Image request sent");
       traceEl.innerHTML = `<span class="pipeline-node running">${escapeHtml(role)}</span>`;
       output = await callAgent("vision", visionData.question || "Describe this image in detail.", 1200, visionData.images, history);
-    } else if (isComplex(task)) {
-      addReasoningStep("Planning request sent");
-      const res = await runMultistep(task, traceEl, history);
-      output = res.result; role = res.role;
-      addReasoningStep(res.steps?.some(([, , result]) => result.startsWith("[Error]")) ? "One specialist step failed" : "All specialist steps returned");
+    } else if (resumeTaskId || isComplex(task)) {
+      addReasoningStep(resumeTaskId ? "Resuming saved task" : "Planning request sent");
+      const res = await runMultistep(task, traceEl, history, resumeTaskId, { convId: targetConvId, branchId: targetBranchId });
+      output = res.result; role = res.role; taskId = res.taskId || taskId;
+      addReasoningStep(res.steps?.some(([, , result]) => taskFailureKind(result)) ? "Some specialist steps need retry" : "All specialist steps returned");
     } else {
       const res = await runSimple(task, history);
       output = res.result; role = res.role;
@@ -5159,6 +5301,7 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
       })();
       const keepAtBottom = isNearChatBottom(chatLog);
       bubble.innerHTML = formatContent(output);
+      if (taskId && (output.includes("**Coverage warning:") || output.includes("**Answer incomplete:"))) attachTaskRecoveryAction(thinkingWrap, taskId);
       if (keepAtBottom) scrollToLatest(false);
       else updateJumpButton();
     }
