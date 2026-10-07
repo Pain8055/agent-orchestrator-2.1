@@ -16,6 +16,7 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
 <noscript><link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"></noscript>
 <script src="vendor/supabase-js-2.117.2.js"></script>
+<script src="provider-policy.js"></script>
 <style>
   :root {
     --bg: #17140F;
@@ -2327,86 +2328,16 @@ try {
   showError("Supabase init failed: " + e.message);
 }
 
+// Exact model IDs and modality-aware fallback order live in provider-policy.js.
 const AGENTS = {
-  head: {
-    system: "You are the lead orchestrator of an AI agent team. You plan, delegate, and give clear final answers.",
-    providers: [
-      { provider: "groq", model: "openai/gpt-oss-120b" },
-      { provider: "gemini", model: "gemini-3.6-flash" },
-      { provider: "openrouter", model: "nvidia/nemotron-3-super-120b-a12b:free" },
-      { provider: "openrouter", model: "meta-llama/llama-3.1-70b-instruct:free" },
-      { provider: "openrouter", model: "deepseek/deepseek-r1:free" },
-    ]
-  },
-  code: {
-    system: "You are a senior software engineer. Write correct, clean, working code. Briefly explain key decisions. No fluff.",
-    providers: [
-      { provider: "openrouter", model: "nvidia/nemotron-3-super-120b-a12b:free" },
-      { provider: "openrouter", model: "meta-llama/llama-3.1-70b-instruct:free" },
-      { provider: "openrouter", model: "deepseek/deepseek-r1:free" },
-      { provider: "gemini", model: "gemini-3.6-flash" },
-      { provider: "groq", model: "openai/gpt-oss-120b" },
-    ]
-  },
-  debug: {
-    system: "You are a debugging specialist. Given broken code or an error, find the root cause precisely and give the exact fix. Explain WHY it broke.",
-    providers: [
-      { provider: "openrouter", model: "nvidia/nemotron-3-super-120b-a12b:free" },
-      { provider: "openrouter", model: "meta-llama/llama-3.1-70b-instruct:free" },
-      { provider: "openrouter", model: "deepseek/deepseek-r1:free" },
-      { provider: "gemini", model: "gemini-3.6-flash" },
-      { provider: "groq", model: "openai/gpt-oss-120b" },
-    ]
-  },
-  reasoning: {
-    system: "You are a reasoning and math specialist. Solve problems step by step, show your work, double-check your final answer.",
-    providers: [
-      { provider: "openrouter", model: "nvidia/nemotron-3-super-120b-a12b:free" },
-      { provider: "openrouter", model: "meta-llama/llama-3.1-70b-instruct:free" },
-      { provider: "openrouter", model: "deepseek/deepseek-r1:free" },
-      { provider: "gemini", model: "gemini-3.6-flash" },
-      { provider: "groq", model: "openai/gpt-oss-120b" },
-    ]
-  },
-  writing: {
-    system: "You are a professional writing assistant. Write clear, well-structured, natural text for the requested purpose.",
-    providers: [
-      { provider: "groq", model: "openai/gpt-oss-120b" },
-      { provider: "gemini", model: "gemini-3.6-flash" },
-      { provider: "openrouter", model: "nvidia/nemotron-3-super-120b-a12b:free" },
-      { provider: "openrouter", model: "meta-llama/llama-3.1-70b-instruct:free" },
-      { provider: "openrouter", model: "deepseek/deepseek-r1:free" },
-    ]
-  },
-  design: {
-    system: "You are a UI/UX design specialist. Give concrete, specific design decisions (colors, layout, spacing, typography) — never vague advice.",
-    providers: [
-      { provider: "groq", model: "openai/gpt-oss-120b" },
-      { provider: "gemini", model: "gemini-3.6-flash" },
-      { provider: "openrouter", model: "nvidia/nemotron-3-super-120b-a12b:free" },
-      { provider: "openrouter", model: "meta-llama/llama-3.1-70b-instruct:free" },
-      { provider: "openrouter", model: "deepseek/deepseek-r1:free" },
-    ]
-  },
-  review: {
-    system: "You are a strict quality reviewer. Given a task and a draft answer, find any mistakes, gaps, or weaknesses. If it's good, say so briefly. If not, give the corrected version.",
-    providers: [
-      { provider: "groq", model: "openai/gpt-oss-120b" },
-      { provider: "gemini", model: "gemini-3.6-flash" },
-      { provider: "openrouter", model: "nvidia/nemotron-3-super-120b-a12b:free" },
-      { provider: "openrouter", model: "meta-llama/llama-3.1-70b-instruct:free" },
-      { provider: "openrouter", model: "deepseek/deepseek-r1:free" },
-    ]
-  },
-  vision: {
-    system: "You are a vision assistant. Describe and analyze the attached image(s) clearly and answer the user's question about them.",
-    providers: [
-      { provider: "openrouter", model: "nvidia/nemotron-3-super-120b-a12b:free" },
-      { provider: "openrouter", model: "meta-llama/llama-3.1-70b-instruct:free" },
-      { provider: "openrouter", model: "deepseek/deepseek-r1:free" },
-      { provider: "gemini", model: "gemini-3.6-flash" },
-    ]
-  },
+  head: { system: "You are the lead orchestrator of an AI agent team. You plan, delegate, and give clear final answers.", providers: ProviderPolicy.models.general },
+  code: { system: "You are a senior software engineer. Write correct, clean, working code. Briefly explain key decisions. No fluff.", providers: ProviderPolicy.models.specialist },
+  debug: { system: "You are a debugging specialist. Given broken code or an error, find the root cause precisely and give the exact fix. Explain WHY it broke.", providers: ProviderPolicy.models.specialist },
+  reasoning: { system: "You are a reasoning and math specialist. Solve problems step by step, show your work, double-check your final answer.", providers: ProviderPolicy.models.specialist },
+  writing: { system: "You are a professional writing assistant. Write clear, well-structured, natural text for the requested purpose.", providers: ProviderPolicy.models.general },
+  design: { system: "You are a UI/UX design specialist. Give concrete, specific design decisions (colors, layout, spacing, typography) — never vague advice.", providers: ProviderPolicy.models.general },
+  review: { system: "You are a strict quality reviewer. Given a task and a draft answer, find any mistakes, gaps, or weaknesses. If it's good, say so briefly. If not, give the corrected version.", providers: ProviderPolicy.models.general },
+  vision: { system: "You are a vision assistant. Describe and analyze the attached image(s) clearly and answer the user's question about them.", providers: ProviderPolicy.models.vision },
 };
 
 
@@ -2663,7 +2594,7 @@ async function runCode(language, code, stdin) {
   return data.data;
 }
 
-async function callAgentRaw(endpoint, model, system, prompt, maxTokens, images, history) {
+async function callAgentRaw(endpoint, model, system, prompt, maxTokens, images, history, timeoutMs = ProviderPolicy.config.requestTimeoutMs) {
   let effectiveSystem = system;
   if (currentProjectInstructions) {
     effectiveSystem += `\n\nProject-specific instructions (always follow these for this project): ${currentProjectInstructions}`;
@@ -2687,7 +2618,7 @@ async function callAgentRaw(endpoint, model, system, prompt, maxTokens, images, 
   // for. It also had no timeout, so one hung provider blocked the entire request forever.
   // Now every failure mode comes back as a normal { ok: false } so the loop just moves on.
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 60000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(endpoint, {
       method: "POST",
@@ -2698,54 +2629,61 @@ async function callAgentRaw(endpoint, model, system, prompt, maxTokens, images, 
     let data;
     try { data = await res.json(); }
     catch { data = { error: `Non-JSON response from provider (HTTP ${res.status})` }; }
-    return { ok: res.ok, status: res.status, data };
+    return { ok: res.ok, status: res.status, data,
+      retryAfterMs: ProviderPolicy.retryAfterMs(res.headers.get("Retry-After")) };
   } catch (e) {
     const timedOut = e && e.name === "AbortError";
-    return { ok: false, status: 0, data: { error: timedOut ? "Provider timed out after 60s" : "Network error: " + (e && e.message ? e.message : e) } };
+    return { ok: false, status: 0, data: { error: timedOut ? `Provider timed out after ${Math.ceil(timeoutMs / 1000)}s` : "Network error: " + (e && e.message ? e.message : e) } };
   } finally {
     clearTimeout(timer);
   }
 }
 
-// ---- Circuit breaker for providers ----
-// With several fallback models per agent, a dead/rate-limited one used to be retried (and
-// waited on) at the start of EVERY call. Now a provider that just failed is skipped for a
-// while: 404 = model removed (long pause), 401/403 = bad key (medium), 429 = rate limited
-// (short), anything else = transient blip (very short). If every provider is cooling down
-// we ignore the cooldowns and try them all, so a bad streak can never lock the app out.
-const providerCooldown = {};
-function providerKey(p) { return p.provider + ":" + p.model; }
-function noteProviderFailure(p, status) {
-  const ms = status === 404 ? 30 * 60000
-    : (status === 401 || status === 403) ? 10 * 60000
-    : status === 429 ? 60000
-    : 20000;
-  providerCooldown[providerKey(p)] = Date.now() + ms;
-}
-function noteProviderSuccess(p) { delete providerCooldown[providerKey(p)]; }
-function availableProviders(agent) {
-  const now = Date.now();
-  const ready = agent.providers.filter(p => !(providerCooldown[providerKey(p)] > now));
-  return ready.length ? ready : agent.providers;
-}
+// Session-local safeguards. Account-wide quotas must be enforced by the backend.
+const providerRouter = ProviderPolicy.createRouter();
 
 // One pass over an agent's providers, in order, until one answers. Shared by the main
 // agent loop and by ask_agent so both get the same timeout/cooldown behaviour.
 async function callProviders(agent, system, prompt, maxTokens, images, history) {
-  let lastError = null;
-  for (const providerConfig of availableProviders(agent)) {
+  const policy = ProviderPolicy.config;
+  const deadline = Date.now() + policy.passTimeoutMs;
+  const ready = providerRouter.available(agent.providers);
+  if (!ready.length) {
+    const wait = Math.ceil(Math.min(...agent.providers.map(p => providerRouter.remaining(p))) / 1000);
+    return { text: null, error: { provider: "router", error: { code: "cooldown", message: Number.isFinite(wait)
+      ? `All configured models are cooling down. Try again in ${wait}s.` : "No providers configured." } } };
+  }
+  let lastError = { provider: "router", error: { code: "budget", message: "Routing time limit reached. Try again later." } };
+  let attempts = 0;
+  for (const providerConfig of ready) {
+    const remainingMs = deadline - Date.now();
+    if (attempts >= policy.maxAttempts || remainingMs <= 0) break;
     const endpoint = PROVIDER_ENDPOINTS[providerConfig.provider];
-    const r = await callAgentRaw(endpoint, providerConfig.model, system, prompt, maxTokens, images, history);
+    if (!endpoint) continue;
+    attempts++;
+    const r = await callAgentRaw(endpoint, providerConfig.model, system, prompt, maxTokens, images, history,
+      Math.min(policy.requestTimeoutMs, remainingMs));
     const text = r.data && typeof r.data.content === "string" ? cleanThinking(r.data.content) : "";
     if (r.ok && text.trim()) {
-      noteProviderSuccess(providerConfig);
-      return { text, error: null };
+      providerRouter.success(providerConfig);
+      return { text, error: null, truncated: r.data.truncated === true || r.data.finish_reason === "length",
+        finishReason: r.data.finish_reason || null, model: r.data.model || providerConfig.model };
     }
     // A successful HTTP response with no usable content is still a provider failure;
     // otherwise the fallback chain would save an empty assistant message and stop.
     const failureStatus = r.ok ? 502 : r.status;
-    noteProviderFailure(providerConfig, failureStatus);
+    const kind = ProviderPolicy.classify(failureStatus, r.data);
+    providerRouter.failure(providerConfig, kind, r.retryAfterMs);
     lastError = { provider: providerConfig.provider, error: r.ok ? { error: "Provider returned no usable content" } : r.data };
+    if (kind === "authorization" || kind === "invalid_request") {
+      // The same session/payload is reused: don't multiply an invalid request.
+      lastError.error = { code: kind, message: kind === "authorization"
+        ? "Authorization failed. Sign in again; if it persists, check backend provider credentials."
+        : "The provider rejected this request. Check its model and supported request options." };
+      break;
+    }
+    if (kind === "capacity") lastError.error = { code: kind,
+      message: "This request exceeds a model's capacity. Try a smaller input. Automatic splitting is not enabled yet." };
   }
   return { text: null, error: lastError };
 }
@@ -2771,9 +2709,13 @@ async function callAgent(role, prompt, maxTokens = null, images = null, history 
     const stepText = attempt.text;
     if (stepText === null) {
       const le = attempt.error;
-      return `[Error] All providers failed for this task. Last error (${le.provider}): ${JSON.stringify(le.error)}`;
+      return `[Error] No answer was produced within the routing limits. (${le.provider}): ${JSON.stringify(le.error)}`;
     }
 
+    // Never execute a partial tool directive. Preserve visible prose with an honest warning.
+    if (attempt.truncated) return stepText + ProviderPolicy.incompleteNotice("The model reached its output limit.");
+    if (attempt.finishReason === "content_filter") return stepText + ProviderPolicy.incompleteNotice("The provider stopped this response for safety filtering.");
+    if (attempt.finishReason === "error") return stepText + ProviderPolicy.incompleteNotice("The provider reported an error during generation.");
     const parsed = parseAgentAction(stepText);
     if (!parsed) {
       if (hasToolDirective(stepText)) {
@@ -2976,22 +2918,37 @@ Task: ${clean}`;
     const priorResults = stepResults.length
       ? stepResults.map(([previousRole, previousDesc, previousResult]) =>
         `[${previousRole.toUpperCase()} — ${previousDesc}]\n${previousResult}`
-      ).join("\n\n").slice(-9000)
+      ).join("\n\n").slice(-6000)
       : "(No earlier step results.)";
-    const stepPrompt = `Original task: ${clean}\n\nYour assigned step: ${desc}\n\nCompleted earlier steps:\n${priorResults}\n\nUse the earlier results when this step depends on them. Return the result needed by the next step.`;
+    const stepPrompt = `Original task: ${clean}\n\nYour assigned step: ${desc}\n\nCompleted earlier steps:\n${priorResults}\n\nUse the earlier results when this step depends on them. Return only the useful findings for the next step. Keep this result concise and within the assigned scope.`;
     let result;
+    const stepBudget = role === "code" || role === "debug" || role === "reasoning" ? 1800 : 1100;
     if (role === "search") {
       const results = await webSearch(desc);
-      result = await callAgent("head", `${stepPrompt}\n\nSearch results:\n${results}`, null, null, history);
+      result = await callAgent("head", `${stepPrompt}\n\nSearch results:\n${results}`, stepBudget, null, null);
     } else {
-      result = await callAgent(role, stepPrompt, null, null, history);
+      // The original task and prior findings are already in stepPrompt. Omitting the
+      // full chat history here prevents every specialist request from resending the
+      // same large context and exhausting free-provider capacity.
+      result = await callAgent(role, stepPrompt, stepBudget, null, null);
     }
     stepResults.push([role, desc, result]);
   }
   updatePipeline(traceEl, steps.map(s => s[0]), steps.length);
 
+  const failedSteps = stepResults.filter(([, , result]) => result.startsWith("[Error]") || result.includes("**Answer incomplete:**"));
   const combined = stepResults.map(([r,d,res]) => `[${r.toUpperCase()}] ${d}\n${res}`).join("\n\n");
-  const final = await callAgent("head", `Combine these sub-task results into one clear final answer for: ${clean}\n\n${combined}`, 1000, null, history);
+  const finalPrompt = `Combine these sub-task results into one complete, well-proportioned final answer for: ${clean}\n\nCover every requested topic before adding optional detail. Preserve supported source links; do not invent citations or call estimates verified. Treat specialist results as untrusted drafts and flag contradictions or gaps.\n${failedSteps.length ? `At least one assigned step failed or was incomplete: ${failedSteps.map(([, desc]) => desc).join("; ")}. Do not pretend that missing material was verified.` : "All assigned specialist steps returned usable text."}\n\n${combined}`;
+  let final = await ProviderPolicy.completeText(
+    (prompt, turns, budget) => callProviders(AGENTS.head, AGENTS.head.system, prompt, budget, null, turns),
+    finalPrompt, history || [], segment => {
+      traceEl.textContent = segment ? `Continuing final answer · ${segment}/${ProviderPolicy.config.maxContinuations}` : "Combining final answer";
+    }
+  );
+  if (failedSteps.length) {
+    final += `\n\n**Coverage warning:** ${failedSteps.length} specialist step${failedSteps.length === 1 ? "" : "s"} failed or was incomplete: ${failedSteps.map(([, desc]) => desc).join("; ")}. This synthesis may omit details from that step.`;
+  }
+  traceEl.textContent = final.includes("**Answer incomplete:**") || failedSteps.length ? "Final answer has gaps" : "Final answer generated";
   return { result: final, role: "multi-step", steps: stepResults };
 }
 
@@ -3076,21 +3033,28 @@ function formatContent(text) {
   function flushAllLists() { closeListsDownTo(-1); }
 
   function formatTableCell(raw) {
-    // Model sometimes escapes newlines literally as backslash-n inside a table cell
-    // to fit multi-line code into one row. Detect and render it as a code block.
-    const hasLiteralNewline = /\\n/.test(raw);
-    const hasBackticks = /`/.test(raw);
-    if (hasLiteralNewline || hasBackticks) {
-      let code = raw.replace(/\\n/g, "\n").replace(/`+/g, "").trim();
-      return `<pre>${code}</pre>`;
+    // Keep inline code inline. A backtick is common in model-generated tables and
+    // turning the entire cell into <pre> made one long cell break the table layout.
+    return inlineFormat(raw).replace(/\\n/g, "<br>");
+  }
+
+  function normalizeTableRow(row, width) {
+    if (row.length > width) {
+      // Unescaped pipes inside a model cell are common. Keep the table rectangular
+      // by folding extra cells into the final column instead of creating overflow.
+      row = [...row.slice(0, width - 1), row.slice(width - 1).join(" | ")];
     }
-    return inlineFormat(raw);
+    while (row.length < width) row.push("");
+    return row;
   }
 
   function flushTable() {
     if (tableRows && tableRows.length) {
-      const [header, ...body] = tableRows;
-      let html = "<table><thead><tr>" + header.map(c => `<th>${inlineFormat(c)}</th>`).join("") + "</tr></thead>";
+      const [rawHeader, ...rawBody] = tableRows;
+      const width = Math.max(1, rawHeader.length);
+      const header = normalizeTableRow(rawHeader, width);
+      const body = rawBody.map(row => normalizeTableRow(row, width));
+      let html = "<table><thead><tr>" + header.map(c => `<th scope="col">${inlineFormat(c)}</th>`).join("") + "</tr></thead>";
       if (body.length) {
         html += "<tbody>" + body.map(row => "<tr>" + row.map(c => `<td>${formatTableCell(c)}</td>`).join("") + "</tr>").join("") + "</tbody>";
       }
@@ -3103,8 +3067,22 @@ function formatContent(text) {
   function parseTableRow(line) {
     let cells = line.trim();
     if (cells.startsWith("|")) cells = cells.slice(1);
-    if (cells.endsWith("|")) cells = cells.slice(0, -1);
-    return cells.split("|").map(c => c.trim());
+    if (cells.endsWith("|") && !cells.endsWith("\\|")) cells = cells.slice(0, -1);
+    const result = [];
+    let cell = "";
+    let codeSpan = false;
+    for (let i = 0; i < cells.length; i++) {
+      const char = cells[i];
+      if (char === "`" && cells[i - 1] !== "\\\\") codeSpan = !codeSpan;
+      if (char === "|" && !codeSpan && cells[i - 1] !== "\\\\") {
+        result.push(cell.trim().replace(/\\\\\|/g, "|"));
+        cell = "";
+      } else {
+        cell += char;
+      }
+    }
+    result.push(cell.trim().replace(/\\\\\|/g, "|"));
+    return result;
   }
 
   function isTableSeparator(line) {
@@ -5147,7 +5125,7 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
     reasoningStepsEl.appendChild(step);
   }
 
-  addReasoningStep("Understand the request");
+  addReasoningStep("Request received");
   const requestMessages = target && Array.isArray(target.messages) ? target.messages : messages;
   const history = buildHistoryForAgent(requestMessages, 1); // exclude the message we just sent (passed as prompt)
 
@@ -5155,25 +5133,24 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
     let output, role;
     if (visionData) {
       role = "vision";
-      addReasoningStep("Inspect the attached image");
+      addReasoningStep("Image request sent");
       traceEl.innerHTML = `<span class="pipeline-node running">${escapeHtml(role)}</span>`;
       output = await callAgent("vision", visionData.question || "Describe this image in detail.", 1200, visionData.images, history);
     } else if (isComplex(task)) {
-      addReasoningStep("Plan the task into smaller steps");
+      addReasoningStep("Planning request sent");
       const res = await runMultistep(task, traceEl, history);
       output = res.result; role = res.role;
-      addReasoningStep("Run the specialist agents");
-      addReasoningStep("Combine and verify the result");
+      addReasoningStep(res.steps?.some(([, , result]) => result.startsWith("[Error]")) ? "One specialist step failed" : "All specialist steps returned");
     } else {
       const res = await runSimple(task, history);
       output = res.result; role = res.role;
-      addReasoningStep(`Ask the ${role} agent to solve it`);
-      addReasoningStep("Check the response before displaying it");
-      traceEl.innerHTML = `<span class="pipeline-node done">${escapeHtml(role)}</span><span class="pipeline-arrow">→</span><span class="pipeline-node done">verified</span>`;
+      addReasoningStep(`${role} request returned`);
+      traceEl.textContent = "Response received";
     }
 
     if (thinkingWrap && isTargetOpen()) {
-      if (reasoningEl) reasoningEl.querySelector("summary").textContent = "Steps taken · complete";
+      if (reasoningEl) reasoningEl.querySelector("summary").textContent = output.includes("**Answer incomplete:**") || output.includes("**Coverage warning:**")
+        ? "Response incomplete" : output.startsWith("[Error]") ? "Request failed" : "Response received";
       thinkingWrap.querySelector(".msg-tag") || (() => {
         const tagEl = document.createElement("div");
         tagEl.className = "msg-tag";

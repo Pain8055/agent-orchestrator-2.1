@@ -1,7 +1,7 @@
 // Scope the cache to this deployment; other apps may share the same origin.
 const CACHE_PREFIX = `agent-team-shell:${self.registration.scope}:`;
-const CACHE_NAME = CACHE_PREFIX + 'v4';
-const APP_SHELL = ['./', './index.html', './manifest.json', './vendor/supabase-js-2.117.2.js']
+const CACHE_NAME = CACHE_PREFIX + 'v6';
+const APP_SHELL = ['./', './index.html', './manifest.json', './provider-policy.js', './vendor/supabase-js-2.117.2.js']
   .map(path => new URL(path, self.registration.scope).href);
 
 self.addEventListener('install', event => {
