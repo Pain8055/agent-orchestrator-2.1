@@ -15,7 +15,18 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
 <noscript><link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"></noscript>
-<script src="vendor/supabase-js-2.117.2.js"></script>
+<!--
+  Keep a local copy for fast/offline startup, but do not make GitHub Pages
+  deployment depend on that untracked asset being present. The fallback is
+  written while the HTML parser is blocked, so the application script below
+  cannot run before Supabase is available.
+-->
+<script src="./vendor/supabase-js-2.117.2.js"></script>
+<script>
+  if (!window.supabase) {
+    document.write('<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2/dist/umd/supabase.min.js"><\/script>');
+  }
+</script>
 <script src="provider-policy.js"></script>
 <style>
   :root {
