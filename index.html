@@ -2068,6 +2068,11 @@
     <button class="hamburger" id="sandboxBackBtn">←</button>
   </div>
   <div class="chats-page-title" style="font-size:22px; margin-bottom:10px;">Sandbox</div>
+  <div class="gh-status" style="display:block; margin-bottom:10px; line-height:1.5;">
+    Privacy notice: code is sent to the free shared Wandbox executor. Do not run passwords,
+    API keys, private files, tokens, or other sensitive data here. Only the code and stdin
+    entered in this panel are submitted; chat history and project instructions are not sent.
+  </div>
 
   <div class="gh-toolbar">
     <select id="sbLanguageSelect" class="gh-branch-select" style="max-width:160px;">
@@ -2824,11 +2829,26 @@ async function requestAgentRunCancellation(context) {
   }
 }
 
-async function runCode(language, code, stdin) {
+const SENSITIVE_CODE_PATTERNS = [
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/i,
+  /\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}\b/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\bAIza[0-9A-Za-z_-]{20,}\b/,
+  /\bsk-[A-Za-z0-9_-]{20,}\b/,
+  /\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
+  /\b(?:api[_-]?key|secret|password|passwd|token|authorization)\s*[:=]\s*['"][^'"]{8,}['"]/i,
+  /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b/i,
+];
+
+function containsSensitiveCode(value) {
+  return SENSITIVE_CODE_PATTERNS.some(pattern => pattern.test(String(value || "")));
+}
+
+async function runCode(language, code, stdin, options = {}) {
   const { res, data } = await fetchJsonWithTimeout(CODE_EXEC_ENDPOINT, {
     method: "POST",
     headers: await getAuthHeaders(),
-    body: JSON.stringify({ language, code, stdin }),
+    body: JSON.stringify({ language, code, stdin, allow_sensitive: options.allowSensitive === true }),
   });
   if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
   if (!data || typeof data !== "object" || !data.data || typeof data.data !== "object") {
@@ -6365,12 +6385,27 @@ document.getElementById("sbRunBtn").onclick = async () => {
   const outEl = document.getElementById("sbOutput");
   const statusEl = document.getElementById("sbStatus");
   if (!code.trim()) { statusEl.textContent = "Write some code first"; statusEl.className = "gh-status err"; return; }
+  const appearsSensitive = containsSensitiveCode(code);
+  let allowSensitive = false;
+  if (appearsSensitive) {
+    const confirmed = confirm(
+      "This code appears to contain a password, token, API key, or other credential-like value.\n\n" +
+      "Wandbox is a public shared executor. Do not submit private data unless you fully understand the risk.\n\n" +
+      "Submit this code anyway?"
+    );
+    if (!confirmed) {
+      statusEl.textContent = "Submission cancelled because the code may contain private data.";
+      statusEl.className = "gh-status err";
+      return;
+    }
+    allowSensitive = true;
+  }
   statusEl.textContent = "Running…";
   statusEl.className = "gh-status";
   document.getElementById("sbRunBtn").disabled = true;
   outEl.textContent = "";
   try {
-    const result = await runCode(language, code);
+    const result = await runCode(language, code, "", { allowSensitive });
     let out = "";
     if (result.compileStderr) out += `[compile stderr]\n${result.compileStderr}\n\n`;
     out += result.stdout || "";
