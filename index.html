@@ -995,6 +995,15 @@
     background: var(--border);
   }
 
+  .durable-run-status {
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 10px;
+    align-self: center;
+    margin-left: 3px;
+  }
+  .durable-run-cancel-btn { color: var(--error); }
+
   .task-recovery-banner {
     display: flex;
     align-items: center;
@@ -2124,6 +2133,8 @@ const PROVIDER_ENDPOINTS = {
 const TAVILY_ENDPOINT = "https://owgdngmkuuqzrdbqekeh.supabase.co/functions/v1/Tavily-chat1";
 const GITHUB_ENDPOINT = "https://owgdngmkuuqzrdbqekeh.supabase.co/functions/v1/github-chat";
 const CODE_EXEC_ENDPOINT = "https://owgdngmkuuqzrdbqekeh.supabase.co/functions/v1/code-exec";
+const AGENT_RUNS_ENDPOINT = "https://owgdngmkuuqzrdbqekeh.supabase.co/functions/v1/agent-runs";
+const AGENT_RUN_WORKER_ENDPOINT = "https://owgdngmkuuqzrdbqekeh.supabase.co/functions/v1/agent-run-worker";
 // ----------------------------------------------------------
 
 // Large attachment libraries load only when the corresponding file is selected.
@@ -2616,6 +2627,203 @@ async function getAuthHeaders() {
   return { "Content-Type": "application/json", Authorization: `Bearer ${data.session.access_token}` };
 }
 
+async function createAgentRun(prompt, target, steps) {
+  const { res, data } = await fetchJsonWithTimeout(AGENT_RUNS_ENDPOINT, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify({
+      action: "create",
+      conversation_id: target.convId,
+      branch_id: target.branchId,
+      prompt,
+      steps: steps.map(([role, description]) => ({ role, description })),
+      client_request_id: crypto.randomUUID(),
+    }),
+  });
+  if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
+  if (!data || typeof data !== "object" || !data.run || !Number.isInteger(data.run.id) || data.run.id < 1) {
+    throw new Error("Agent run service returned an invalid response");
+  }
+  return data.run.id;
+}
+
+function workerHasStarted(data) {
+  const run = data?.run || {};
+  if (run.worker_id || Number(run.attempts) > 0) return true;
+  return (data?.events || []).some(event => [
+    "worker_claimed", "step_started", "step_completed", "step_paused", "step_failed",
+    "synthesis_started", "run_paused", "run_failed", "run_completed", "run_cancelled",
+  ].includes(event.event_type));
+}
+
+async function invokeAgentRunWorker(runId) {
+  if (!Number.isInteger(runId) || runId < 1) throw new Error("A valid durable run id is required");
+  const { res, data } = await fetchJsonWithTimeout(AGENT_RUN_WORKER_ENDPOINT, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify({ run_id: runId }),
+  }, 240000);
+  if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
+  if (!data || typeof data !== "object" || data.run_id !== runId
+    || !["running", "synthesizing", "paused", "completed", "failed", "cancelled"].includes(data.status)) {
+    throw new Error("Agent run worker returned an invalid response");
+  }
+  return data;
+}
+
+async function updateAgentRun(runId, patch) {
+  if (!Number.isInteger(runId) || runId < 1) throw new Error("A valid durable run id is required");
+  const { res, data } = await fetchJsonWithTimeout(AGENT_RUNS_ENDPOINT, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify({ action: "update", run_id: runId, ...patch }),
+  });
+  if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
+  return data;
+}
+
+async function getAgentRunStatus(runId, afterEventId = 0) {
+  const { res, data } = await fetchJsonWithTimeout(AGENT_RUNS_ENDPOINT, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify({ action: "status", run_id: runId, after_event_id: afterEventId }),
+  });
+  if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
+  if (!data || typeof data !== "object" || !data.run) throw new Error("Agent run service returned an invalid status");
+  return data;
+}
+
+async function cancelAgentRun(runId, reason = "Cancelled by the user") {
+  const { res, data } = await fetchJsonWithTimeout(AGENT_RUNS_ENDPOINT, {
+    method: "POST",
+    headers: await getAuthHeaders(),
+    body: JSON.stringify({ action: "cancel", run_id: runId, reason }),
+  });
+  if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
+  if (!data || typeof data !== "object" || !data.run) throw new Error("Agent run service returned an invalid cancellation response");
+  return data.run;
+}
+
+const activeAgentRuns = new Map();
+const TERMINAL_AGENT_RUN_STATUSES = new Set(["completed", "paused", "failed", "cancelled"]);
+
+function durableRunStatusLabel(status) {
+  return status ? `Durable · ${status}` : "Durable · running";
+}
+
+function setAgentRunUiState(context, status, cancelled = false) {
+  if (!context) return;
+  context.lastStatus = status || context.lastStatus || "running";
+  const wrap = context.traceEl?.closest?.(".msg");
+  const button = wrap?.querySelector(".durable-run-cancel-btn");
+  const label = wrap?.querySelector(".durable-run-status");
+  if (label) label.textContent = durableRunStatusLabel(cancelled ? "cancelled" : context.lastStatus);
+  if (button) {
+    button.hidden = !["running", "synthesizing"].includes(context.lastStatus) && !cancelled;
+    button.disabled = cancelled || context.cancelRequested || !["running", "synthesizing"].includes(context.lastStatus);
+    if (cancelled) button.textContent = "Cancelled";
+  }
+}
+
+function stopAgentRunPolling(context) {
+  if (!context) return;
+  if (context.pollTimer) clearInterval(context.pollTimer);
+  context.pollTimer = null;
+  if (context.runId) activeAgentRuns.delete(context.runId);
+}
+
+function applyAgentRunStatus(context, data) {
+  if (!context || !data) return data;
+  context.lastEventId = Number.isInteger(data.next_event_id) ? data.next_event_id : context.lastEventId || 0;
+  const status = data.run?.status;
+  if (status) setAgentRunUiState(context, status);
+  if (status === "cancelled" || data.run?.cancel_requested_at) {
+    context.cancelled = true;
+    context.cancelRequested = true;
+    setAgentRunUiState(context, "cancelled", true);
+  }
+  if (TERMINAL_AGENT_RUN_STATUSES.has(status)) stopAgentRunPolling(context);
+  return data;
+}
+
+async function pollAgentRunStatus(context, options = {}) {
+  if (!context?.runId || context.pollingDisabled) return null;
+  if (context.polling) return context.pollPromise || null;
+  context.polling = true;
+  context.pollPromise = (async () => {
+    try {
+      const data = await getAgentRunStatus(context.runId, context.lastEventId || 0);
+      return applyAgentRunStatus(context, data);
+    } catch (error) {
+      // Durable tracking is advisory for browser fallback. The server-worker
+      // path opts into strict polling so an unknown status never starts a
+      // second execution of a run that may already be owned by the worker.
+      context.pollingDisabled = true;
+      console.warn("Durable run status polling failed", error.message);
+      if (options.strict) throw error;
+      return null;
+    } finally {
+      context.polling = false;
+      context.pollPromise = null;
+    }
+  })();
+  return context.pollPromise;
+}
+
+function startAgentRunPolling(context) {
+  if (!context?.runId) return;
+  activeAgentRuns.set(context.runId, context);
+  setAgentRunUiState(context, "running");
+  pollAgentRunStatus(context);
+  context.pollTimer = setInterval(() => pollAgentRunStatus(context), 2500);
+}
+
+function waitForAgentRunDelay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForAgentRunTerminal(context, initial = null) {
+  let data = initial;
+  while (true) {
+    if (!data) data = await getAgentRunStatus(context.runId, context.lastEventId || 0);
+    applyAgentRunStatus(context, data);
+    if (TERMINAL_AGENT_RUN_STATUSES.has(data.run?.status)) return data;
+    await waitForAgentRunDelay(2500);
+    data = await getAgentRunStatus(context.runId, context.lastEventId || 0);
+  }
+}
+
+async function persistDurableRun(context, patch) {
+  if (!context?.runId || context.persistenceDisabled || context.cancelled) return false;
+  try {
+    await updateAgentRun(context.runId, patch);
+    if (patch.status) setAgentRunUiState(context, patch.status);
+    return true;
+  } catch (error) {
+    context.persistenceDisabled = true;
+    console.warn("Durable run update failed; continuing in the browser", error.message);
+    return false;
+  }
+}
+
+async function requestAgentRunCancellation(context) {
+  if (!context?.runId || context.cancelRequested) return;
+  // Set the local flag before the network round trip. This is what prevents a
+  // browser step that is just returning from starting the next step/final write.
+  context.cancelRequested = true;
+  context.cancelled = true;
+  setAgentRunUiState(context, "cancelled", true);
+  try {
+    const run = await cancelAgentRun(context.runId);
+    context.lastStatus = run.status || "cancelled";
+    setAgentRunUiState(context, "cancelled", true);
+  } catch (error) {
+    context.persistenceDisabled = true;
+    showInfo("The durable cancel request failed. This browser run was stopped locally.");
+    console.warn("Durable run cancellation failed", error.message);
+  }
+}
+
 async function runCode(language, code, stdin) {
   const { res, data } = await fetchJsonWithTimeout(CODE_EXEC_ENDPOINT, {
     method: "POST",
@@ -2977,6 +3185,40 @@ function taskFailureKind(result) {
   return null;
 }
 
+async function syncLegacyAgentTask(taskId, data) {
+  if (!taskId || !data?.run) return;
+  const run = data.run;
+  await updateAgentTask(taskId, {
+    status: run.status === "cancelled" ? "cancelled" : run.status,
+    current_step: Number.isInteger(run.current_step) ? run.current_step : 0,
+    result: typeof run.result === "string" ? run.result : null,
+    error_kind: run.error_kind || null,
+    error_message: run.error_message || null,
+    completed_at: run.completed_at || null,
+  });
+  for (const step of data.steps || []) {
+    await updateAgentTaskStep(taskId, step.step_index, {
+      status: step.status,
+      result: step.result || null,
+      provider: step.provider || null,
+      attempts: Number.isInteger(step.attempts) ? step.attempts : 0,
+      error_kind: step.error_kind || null,
+      error_message: step.error_message || null,
+      started_at: step.started_at || null,
+      completed_at: step.completed_at || null,
+    });
+  }
+}
+
+function durableRunOutput(data) {
+  const run = data?.run || {};
+  if (typeof run.result === "string" && run.result.trim()) return run.result;
+  if (run.status === "failed") return `[Error] ${run.error_message || "The server worker failed before producing a result."}`;
+  if (run.status === "paused") return `**Coverage warning:** ${run.error_message || "The server worker paused before producing a complete result. Resume the task to retry incomplete work."}`;
+  if (run.status === "cancelled") return "[Cancelled] This task was cancelled before final synthesis.";
+  return `[Error] The server worker returned no result for this run.`;
+}
+
 async function runSimple(task, history = null) {
   const [role, clean] = detectRole(task);
   if (role === "search") {
@@ -2991,8 +3233,32 @@ async function runSimple(task, history = null) {
 async function runMultistep(task, traceEl, history = null, resumeTaskId = null, target = null) {
   const clean = task.toLowerCase().startsWith("plan:") ? task.slice(5).trim() : task;
   let taskId = resumeTaskId;
+  let runId = null;
+  let durable = null;
   let steps = [];
   let stepResults = [];
+  // Older clients/tests can still run the browser orchestration function without
+  // loading the optional durable-run UI helpers.
+  const persist = (...args) => typeof persistDurableRun === "function" ? persistDurableRun(...args) : Promise.resolve(false);
+  const poll = (...args) => typeof pollAgentRunStatus === "function" ? pollAgentRunStatus(...args) : Promise.resolve(null);
+  const stopPolling = context => { if (typeof stopAgentRunPolling === "function") stopAgentRunPolling(context); };
+  const setRunUi = (...args) => { if (typeof setAgentRunUiState === "function") setAgentRunUiState(...args); };
+
+  async function cancelledResult(legacyStatus = "paused") {
+    await updateAgentTask(taskId, {
+      status: legacyStatus, error_kind: "cancelled", error_message: "Cancelled by the user"
+    });
+    updatePipeline(traceEl, steps.map(s => s[0]), steps.length ? Math.min(steps.length - 1, stepResults.filter(Boolean).length) : -1);
+    traceEl.textContent = "Run cancelled";
+    if (durable) {
+      setRunUi(durable, "cancelled", true);
+      stopPolling(durable);
+    }
+    return {
+      result: "[Cancelled] This task was cancelled before final synthesis.",
+      role: "multi-step", steps: stepResults, taskId, runId, cancelled: true
+    };
+  }
 
   if (resumeTaskId) {
     const saved = await loadAgentTask(resumeTaskId);
@@ -3016,58 +3282,207 @@ Task: ${clean}`;
       const result = await callAgent("head", clean, null, null, history);
       return { result, role: "head", taskId: null, steps: [] };
     }
-    taskId = await createAgentTask(clean, target || { convId: currentConvId, branchId: currentBranchId }, steps);
+    const runTarget = target || { convId: currentConvId, branchId: currentBranchId };
+    try {
+      runId = await createAgentRun(clean, runTarget, steps);
+      durable = { runId, traceEl, lastStatus: "running", lastEventId: 0 };
+      if (traceEl?.dataset) traceEl.dataset.agentRunId = String(runId);
+      if (typeof attachAgentRunControls === "function") attachAgentRunControls(traceEl, durable);
+      if (typeof startAgentRunPolling === "function") startAgentRunPolling(durable);
+    } catch (error) {
+      showInfo("Durable run tracking is unavailable; this run will continue in the browser.");
+    }
+    taskId = await createAgentTask(clean, runTarget, steps);
     stepResults = steps.map(() => null);
+
+    // A newly-created durable run belongs to the server worker. The browser
+    // loop below is retained for old deployments and only runs when worker
+    // setup failed before the run showed any worker activity.
+    if (durable && typeof invokeAgentRunWorker === "function") {
+      try {
+        const workerResponse = await invokeAgentRunWorker(runId);
+        const terminal = await waitForAgentRunTerminal(durable);
+        await syncLegacyAgentTask(taskId, terminal);
+        stepResults = (terminal.steps || []).map(step => step.status === "completed" && step.result
+          ? [step.role, step.description, step.result] : null);
+        if (terminal.run?.status === "cancelled") {
+          durable.cancelled = true;
+          return await cancelledResult("cancelled");
+        }
+        if (TERMINAL_AGENT_RUN_STATUSES.has(terminal.run?.status)) {
+          const output = durableRunOutput(terminal);
+          traceEl.textContent = terminal.run.status === "completed" ? "Final answer generated"
+            : terminal.run.status === "paused" ? "Final answer has gaps" : "Run failed";
+          setRunUi(durable, terminal.run.status);
+          stopPolling(durable);
+          return { result: output, role: "multi-step", steps: stepResults, taskId, runId, status: terminal.run.status };
+        }
+      } catch (error) {
+        // A worker request can time out after it has claimed the run. Inspect
+        // durable state before allowing browser fallback; otherwise this tab
+        // could execute the same run concurrently with the server worker.
+        let state;
+        try {
+          state = await getAgentRunStatus(runId, durable.lastEventId || 0);
+        } catch (statusError) {
+          throw new Error(`Server worker status is unavailable after invocation failure: ${statusError.message}`);
+        }
+        applyAgentRunStatus(durable, state);
+        if (TERMINAL_AGENT_RUN_STATUSES.has(state.run?.status)) {
+          await syncLegacyAgentTask(taskId, state);
+          stepResults = (state.steps || []).map(step => step.status === "completed" && step.result
+            ? [step.role, step.description, step.result] : null);
+          if (state.run.status === "cancelled") {
+            durable.cancelled = true;
+            return await cancelledResult("cancelled");
+          }
+          const output = durableRunOutput(state);
+          traceEl.textContent = state.run.status === "completed" ? "Final answer generated"
+            : state.run.status === "paused" ? "Final answer has gaps" : "Run failed";
+          stopPolling(durable);
+          return { result: output, role: "multi-step", steps: stepResults, taskId, runId, status: state.run.status };
+        }
+        if (workerHasStarted(state)) {
+          const terminal = await waitForAgentRunTerminal(durable, state);
+          await syncLegacyAgentTask(taskId, terminal);
+          stepResults = (terminal.steps || []).map(step => step.status === "completed" && step.result
+            ? [step.role, step.description, step.result] : null);
+          if (terminal.run?.status === "cancelled") {
+            durable.cancelled = true;
+            return await cancelledResult("cancelled");
+          }
+          const output = durableRunOutput(terminal);
+          traceEl.textContent = terminal.run.status === "completed" ? "Final answer generated"
+            : terminal.run.status === "paused" ? "Final answer has gaps" : "Run failed";
+          stopPolling(durable);
+          return { result: output, role: "multi-step", steps: stepResults, taskId, runId, status: terminal.run.status };
+        }
+        if (typeof showInfo === "function") showInfo("The server worker could not start; continuing this task in the browser.");
+        durable.workerFallback = true;
+      }
+    } else if (durable) {
+      // Compatibility for an older cached client that knows durable runs but
+      // has not yet received the worker helper.
+      durable.workerFallback = true;
+      if (typeof showInfo === "function") showInfo("The server worker is unavailable; continuing this task in the browser.");
+    }
   }
 
   updatePipeline(traceEl, steps.map(s => s[0]), -1);
   for (let i = 0; i < steps.length; i++) {
     const [role, desc] = steps[i];
     if (stepResults[i]) continue;
+    if (durable) await poll(durable);
+    if (durable?.cancelled) return cancelledResult();
     updatePipeline(traceEl, steps.map(s => s[0]), i);
     await updateAgentTask(taskId, { status: "running", current_step: i });
-    await updateAgentTaskStep(taskId, i, { status: "running", attempts: 1, started_at: new Date().toISOString(), error_kind: null, error_message: null });
+    const startedAt = new Date().toISOString();
+    await updateAgentTaskStep(taskId, i, { status: "running", attempts: 1, started_at: startedAt, error_kind: null, error_message: null });
+    await persist(durable, {
+      current_step: i,
+      step: { step_index: i, status: "running", attempts: 1, started_at: startedAt, error_kind: null, error_message: null },
+      event: { event_type: "step_started", step_index: i, payload: { role, description: desc } },
+    });
     const priorResults = stepResults.filter(Boolean).map(([previousRole, previousDesc, previousResult]) =>
       `[${previousRole.toUpperCase()} — ${previousDesc}]\n${previousResult}`
     ).join("\n\n").slice(-6000) || "(No earlier step results.)";
     const stepPrompt = `Original task: ${clean}\n\nYour assigned step: ${desc}\n\nCompleted earlier steps:\n${priorResults}\n\nUse the earlier results when this step depends on them. Return only the useful findings for the next step. Keep this result concise and within the assigned scope.`;
     const stepBudget = role === "code" || role === "debug" || role === "reasoning" ? 1800 : 1100;
     let result;
-    if (role === "search") {
-      const results = await webSearch(desc);
-      result = await callAgent("head", `${stepPrompt}\n\nSearch results:\n${results}`, stepBudget, null, null);
-    } else {
-      result = await callAgent(role, stepPrompt, stepBudget, null, null);
+    try {
+      if (role === "search") {
+        const results = await webSearch(desc);
+        result = await callAgent("head", `${stepPrompt}\n\nSearch results:\n${results}`, stepBudget, null, null);
+      } else {
+        result = await callAgent(role, stepPrompt, stepBudget, null, null);
+      }
+    } catch (error) {
+      const message = `[Error] ${error?.message || error}`;
+      await updateAgentTaskStep(taskId, i, {
+        status: "failed", result: message, error_kind: "execution_error", error_message: message.slice(0, 500),
+        completed_at: new Date().toISOString()
+      });
+      await persist(durable, {
+        step: { step_index: i, status: "failed", result: message, error_kind: "execution_error", error_message: message.slice(0, 500), completed_at: new Date().toISOString() },
+        event: { event_type: "step_failed", step_index: i, payload: { role, description: desc, error: message.slice(0, 500) } },
+      });
+      await persist(durable, {
+        status: "failed", result: message, error_kind: "execution_error", error_message: message.slice(0, 500),
+        completed_at: new Date().toISOString(),
+        event: { event_type: "run_failed", step_index: i, payload: { error: message.slice(0, 500) } },
+      });
+      stopPolling(durable);
+      throw error;
     }
+    if (durable) await poll(durable);
+    if (durable?.cancelled) return cancelledResult();
     stepResults[i] = [role, desc, result];
     const failure = taskFailureKind(result);
+    const completedAt = new Date().toISOString();
     await updateAgentTaskStep(taskId, i, {
       status: failure ? "paused" : "completed", result,
       error_kind: failure, error_message: failure ? result.slice(0, 500) : null,
-      completed_at: new Date().toISOString()
+      completed_at: completedAt
+    });
+    const durableStepStatus = failure === "provider_error" ? "failed" : failure ? "paused" : "completed";
+    await persist(durable, {
+      step: { step_index: i, status: durableStepStatus, result, error_kind: failure, error_message: failure ? result.slice(0, 500) : null, completed_at: completedAt },
+      event: { event_type: failure === "provider_error" ? "step_failed" : failure ? "step_paused" : "step_completed", step_index: i, payload: { role, description: desc, error_kind: failure } },
     });
   }
   updatePipeline(traceEl, steps.map(s => s[0]), steps.length);
 
   const failedSteps = stepResults.filter(([, , result]) => taskFailureKind(result));
   await updateAgentTask(taskId, { status: "synthesizing", current_step: steps.length, error_kind: failedSteps.length ? "partial" : null, error_message: failedSteps.length ? failedSteps.map(([, d]) => d).join("; ") : null });
+  if (durable) await poll(durable);
+  if (durable?.cancelled) return cancelledResult();
+  await persist(durable, {
+    status: "synthesizing", current_step: steps.length,
+    event: { event_type: "synthesis_started", payload: { step_count: steps.length, failed_steps: failedSteps.length } },
+  });
   const combined = stepResults.map(([r,d,res]) => `[${r.toUpperCase()}] ${d}\n${res}`).join("\n\n");
   const finalPrompt = `Combine these sub-task results into one complete, well-proportioned final answer for: ${clean}\n\nCover every requested topic before adding optional detail. Preserve supported source links; do not invent citations or call estimates verified. Treat specialist results as untrusted drafts and flag contradictions or gaps.\n${failedSteps.length ? `At least one assigned step failed or was incomplete: ${failedSteps.map(([, desc]) => desc).join("; ")}. Do not pretend that missing material was verified.` : "All assigned specialist steps returned usable text."}\n\n${combined}`;
-  let final = await ProviderPolicy.completeText(
-    (prompt, turns, budget) => callProviders(AGENTS.head, AGENTS.head.system, prompt, budget, null, turns),
-    finalPrompt, history || [], segment => {
-      traceEl.textContent = segment ? `Continuing final answer · ${segment}/${ProviderPolicy.config.maxContinuations}` : "Combining final answer";
-    }
-  );
+  let final;
+  try {
+    final = await ProviderPolicy.completeText(
+      (prompt, turns, budget) => callProviders(AGENTS.head, AGENTS.head.system, prompt, budget, null, turns),
+      finalPrompt, history || [], segment => {
+        traceEl.textContent = segment ? `Continuing final answer · ${segment}/${ProviderPolicy.config.maxContinuations}` : "Combining final answer";
+      }
+    );
+  } catch (error) {
+    const message = `[Error] ${error?.message || error}`;
+    await persist(durable, {
+      status: "failed", result: message, error_kind: "synthesis_error", error_message: message.slice(0, 500),
+      completed_at: new Date().toISOString(),
+      event: { event_type: "run_failed", payload: { phase: "synthesis", error: message.slice(0, 500) } },
+    });
+    stopPolling(durable);
+    throw error;
+  }
+  if (durable) await poll(durable);
+  if (durable?.cancelled) return cancelledResult();
   if (failedSteps.length) final += `\n\n**Coverage warning:** ${failedSteps.length} specialist step${failedSteps.length === 1 ? "" : "s"} failed or was incomplete: ${failedSteps.map(([, desc]) => desc).join("; ")}. This synthesis may omit details from that step.`;
   const finalIncomplete = final.includes("**Answer incomplete:**");
+  const finalStatus = finalIncomplete || failedSteps.length ? "paused" : "completed";
+  await persist(durable, {
+    status: finalStatus, result: final,
+    error_kind: finalIncomplete ? "output_limit" : failedSteps.length ? "partial" : null,
+    error_message: finalIncomplete ? "Final answer reached the output limit" : failedSteps.length ? failedSteps.map(([, d]) => d).join("; ") : null,
+    completed_at: finalStatus === "completed" ? new Date().toISOString() : null,
+    event: { event_type: finalStatus === "completed" ? "run_completed" : "run_paused", payload: { failed_steps: failedSteps.length, incomplete: finalIncomplete } },
+  });
   await updateAgentTask(taskId, {
-    status: finalIncomplete || failedSteps.length ? "paused" : "completed",
+    status: finalStatus,
     result: final, error_kind: finalIncomplete ? "output_limit" : failedSteps.length ? "partial" : null,
     completed_at: finalIncomplete || failedSteps.length ? null : new Date().toISOString()
   });
   traceEl.textContent = finalIncomplete || failedSteps.length ? "Final answer has gaps" : "Final answer generated";
-  return { result: final, role: "multi-step", steps: stepResults, taskId };
+  if (durable) {
+    setRunUi(durable, finalStatus);
+    stopPolling(durable);
+  }
+  return { result: final, role: "multi-step", steps: stepResults, taskId, runId };
 }
 
 async function retryAgentTask(taskId) {
@@ -3101,6 +3516,17 @@ function attachTaskRecoveryAction(wrap, taskId) {
   button.textContent = "↻ Retry failed steps";
   button.onclick = () => retryAgentTask(taskId);
   actionRow.appendChild(button);
+}
+
+function attachAgentRunControls(traceEl, context) {
+  if (!traceEl || !context?.runId) return;
+  context.traceEl = traceEl;
+  const wrap = traceEl.closest?.(".msg");
+  const button = wrap?.querySelector(".durable-run-cancel-btn");
+  if (!button) return;
+  button.hidden = false;
+  button.onclick = () => requestAgentRunCancellation(context);
+  setAgentRunUiState(context, context.lastStatus || "running");
 }
 
 function updatePipeline(el, roles, activeIndex) {
@@ -3381,6 +3807,8 @@ function addMessage(role, content, tag = null, msgId = null, scroll = true) {
       <button class="action-btn copy-btn" title="Copy">⧉</button>
       <button class="action-btn regen-btn" title="Regenerate">↻</button>
       <button class="action-btn reply-btn" title="Reply">↩</button>
+      <button class="action-btn durable-run-cancel-btn" title="Cancel durable run" hidden>Cancel</button>
+      <span class="durable-run-status" aria-live="polite"></span>
     </div>` : "";
 
   wrap.innerHTML = `
@@ -5283,7 +5711,7 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
   const history = buildHistoryForAgent(requestMessages, 1); // exclude the message we just sent (passed as prompt)
 
   try {
-    let output, role, taskId = resumeTaskId;
+    let output, role, taskId = resumeTaskId, cancelled = false, runStatus = null;
     if (visionData) {
       role = "vision";
       addReasoningStep("Image request sent");
@@ -5293,7 +5721,9 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
       addReasoningStep(resumeTaskId ? "Resuming saved task" : "Planning request sent");
       const res = await runMultistep(task, traceEl, history, resumeTaskId, { convId: targetConvId, branchId: targetBranchId });
       output = res.result; role = res.role; taskId = res.taskId || taskId;
-      addReasoningStep(res.steps?.some(([, , result]) => taskFailureKind(result)) ? "Some specialist steps need retry" : "All specialist steps returned");
+      cancelled = res.cancelled === true;
+      runStatus = res.status || null;
+      addReasoningStep(cancelled ? "Run cancelled" : res.steps?.some(([, , result]) => taskFailureKind(result)) ? "Some specialist steps need retry" : "All specialist steps returned");
     } else {
       const res = await runSimple(task, history);
       output = res.result; role = res.role;
@@ -5302,7 +5732,7 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
     }
 
     if (thinkingWrap && isTargetOpen()) {
-      if (reasoningEl) reasoningEl.querySelector("summary").textContent = output.includes("**Answer incomplete:**") || output.includes("**Coverage warning:**")
+       if (reasoningEl) reasoningEl.querySelector("summary").textContent = cancelled ? "Run cancelled" : output.includes("**Answer incomplete:**") || output.includes("**Coverage warning:**")
         ? "Response incomplete" : output.startsWith("[Error]") ? "Request failed" : "Response received";
       thinkingWrap.querySelector(".msg-tag") || (() => {
         const tagEl = document.createElement("div");
@@ -5312,7 +5742,8 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
       })();
       const keepAtBottom = isNearChatBottom(chatLog);
       bubble.innerHTML = formatContent(output);
-      if (taskId && (output.includes("**Coverage warning:") || output.includes("**Answer incomplete:"))) attachTaskRecoveryAction(thinkingWrap, taskId);
+       if (taskId && (runStatus === "paused" || runStatus === "failed"
+         || output.includes("**Coverage warning:") || output.includes("**Answer incomplete:"))) attachTaskRecoveryAction(thinkingWrap, taskId);
       if (keepAtBottom) scrollToLatest(false);
       else updateJumpButton();
     }
