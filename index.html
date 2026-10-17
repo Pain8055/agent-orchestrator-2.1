@@ -2309,6 +2309,36 @@ if (window.innerWidth <= 768) {
 // username, while this fixed internal email identifies the one allowed account.
 const LOGIN_USERNAME = "anu";
 const LOGIN_EMAIL = "anudelu07@gmail.com";
+let authConnectPromise = null;
+let activeAuthUserId = null;
+
+function isWorkspaceAuthUser(authUser) {
+  return Boolean(authUser?.id && typeof authUser.email === "string"
+    && authUser.email.toLowerCase() === LOGIN_EMAIL.toLowerCase());
+}
+
+function showSignedOutGate(message = "") {
+  activeAuthUserId = null;
+  userId = "";
+  document.getElementById("chatView").style.display = "none";
+  document.getElementById("gateView").style.display = "flex";
+  document.getElementById("gateError").textContent = message;
+}
+
+function connectAuthenticatedUser(authUser) {
+  if (!isWorkspaceAuthUser(authUser)) {
+    showSignedOutGate("Please sign in to your workspace.");
+    return Promise.reject(new Error("This account is not authorized for the workspace."));
+  }
+  if (activeAuthUserId === authUser.id && userId === LOGIN_USERNAME
+    && document.getElementById("chatView").style.display === "flex") return Promise.resolve();
+  if (authConnectPromise) return authConnectPromise;
+  activeAuthUserId = authUser.id;
+  authConnectPromise = connect(LOGIN_USERNAME, authUser).finally(() => {
+    authConnectPromise = null;
+  });
+  return authConnectPromise;
+}
 
 async function attemptLogin() {
   const username = document.getElementById("gateInput").value.trim();
@@ -2329,7 +2359,7 @@ async function attemptLogin() {
     });
     if (authError) throw authError;
     error.textContent = "";
-    await connect(LOGIN_USERNAME, data.user);
+    await connectAuthenticatedUser(data.user);
   } catch (e) {
     error.textContent = "Invalid username or password.";
   } finally {
@@ -2379,7 +2409,25 @@ window.addEventListener("unhandledrejection", function(event) {
 let sb;
 try {
   if (!window.supabase) throw new Error("Supabase library failed to load from CDN");
-  sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  // Keep the default Supabase storage key so sessions created by older builds
+  // remain available after an app/PWA restart. The explicit options document
+  // the behavior we rely on: closing the app must not sign the user out.
+  sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
+  });
+  sb.auth.onAuthStateChange((event, session) => {
+    if (event === "SIGNED_OUT") {
+      showSignedOutGate("Your session ended. Sign in again to continue.");
+      return;
+    }
+    if ((event === "INITIAL_SESSION" || event === "SIGNED_IN") && session?.user) {
+      // Do not await connect from inside Supabase's auth callback; workspace
+      // loading performs Supabase requests of its own.
+      setTimeout(() => connectAuthenticatedUser(session.user).catch(error => {
+        if (event !== "INITIAL_SESSION") showError(error.message);
+      }), 0);
+    }
+  });
 } catch (e) {
   showError("Supabase init failed: " + e.message);
 }
@@ -3484,6 +3532,91 @@ async function runSimple(task, history = null) {
   }
   const result = await callAgent(role, clean, null, null, history);
   return { result, role };
+}
+
+function queuedDurableRunResult(durable, taskId, runId, role) {
+  if (durable) {
+    durable.persistenceDeferred = true;
+    setAgentRunUiState(durable, "running");
+  }
+  return {
+    result: "[Queued] This task is running in the background. Reopen this conversation to see the completed answer.",
+    role, taskId, runId, status: "running", persistenceDeferred: true,
+  };
+}
+
+// One-shot requests used to execute entirely in this page, so closing the app
+// cancelled them. Give them the same server-owned lease and queue as complex
+// runs. The worker still performs a specialist call followed by synthesis, but
+// it can now finish after this JavaScript context is gone.
+async function runDurableSingleStep(task, traceEl, target = null) {
+  const [detectedRole, clean] = detectRole(task);
+  const role = detectedRole === "search" ? "head" : detectedRole;
+  const description = detectedRole === "search"
+    ? `Answer this research request as accurately as possible: ${clean}`
+    : `Answer the user's request directly and completely: ${clean}`;
+  const runTarget = target || { convId: currentConvId, branchId: currentBranchId };
+  const steps = [[role, description]];
+  if (isComplex(task)) {
+    steps.push(["review", `Check the draft answer for missing requirements, unsupported claims, and practical corrections: ${clean}`]);
+  }
+  const runId = await createAgentRun(task, runTarget, steps);
+  const durable = { runId, traceEl, lastStatus: "running", lastEventId: 0 };
+  if (traceEl?.dataset) traceEl.dataset.agentRunId = String(runId);
+  if (typeof attachAgentRunControls === "function") attachAgentRunControls(traceEl, durable);
+  if (typeof startAgentRunPolling === "function") startAgentRunPolling(durable);
+
+  const taskId = await createAgentTask(clean, runTarget, steps);
+  let workerResponse = null;
+  try {
+    workerResponse = await invokeAgentRunWorker(runId);
+  } catch (error) {
+    // The cron dispatcher may have claimed the run, or the foreground request
+    // may have failed before it reached the function. Inspect durable state;
+    // never fall back to browser execution after a run has been created.
+    let state = null;
+    try { state = await getAgentRunStatus(runId, durable.lastEventId || 0); } catch (statusError) {
+      console.warn("Durable run is queued after worker request failure", statusError.message);
+      return queuedDurableRunResult(durable, taskId, runId, role);
+    }
+    applyAgentRunStatus(durable, state);
+    if (TERMINAL_AGENT_RUN_STATUSES.has(state.run?.status)) {
+      workerResponse = state;
+    } else if (workerHasStarted(state)) {
+      try {
+        const terminal = await waitForAgentRunTerminal(durable, state);
+        workerResponse = terminal;
+      } catch (waitError) {
+        console.warn("Durable run will continue after foreground polling failed", waitError.message);
+        return queuedDurableRunResult(durable, taskId, runId, role);
+      }
+    } else {
+      console.warn("Durable worker has not started yet", error.message);
+      return queuedDurableRunResult(durable, taskId, runId, role);
+    }
+  }
+
+  const terminal = workerResponse?.run ? workerResponse : await waitForAgentRunTerminal(durable);
+  applyAgentRunStatus(durable, terminal);
+  if (taskId) await syncLegacyAgentTask(taskId, terminal);
+  const status = terminal.run?.status;
+  if (status === "cancelled") {
+    durable.cancelled = true;
+    stopAgentRunPolling(durable);
+    return { result: durableRunOutput(terminal), role, taskId, runId, status, cancelled: true };
+  }
+  if (!TERMINAL_AGENT_RUN_STATUSES.has(status)) return queuedDurableRunResult(durable, taskId, runId, role);
+  const output = durableRunOutput(terminal);
+  if (traceEl) traceEl.textContent = status === "completed" ? "Final answer generated"
+    : status === "paused" ? "Final answer has gaps" : "Run failed";
+  const completionPersisted = workerResponse?.completion_persisted === true
+    || Number.isInteger(workerResponse?.assistant_message_id)
+    || Number.isInteger(terminal.run?.completion_message_id);
+  stopAgentRunPolling(durable);
+  return {
+    result: output, role, taskId, runId, status,
+    completionPersisted, assistantMessage: workerResponse?.assistant_message || null,
+  };
 }
 
 async function runMultistep(task, traceEl, history = null, resumeTaskId = null, target = null) {
@@ -5429,8 +5562,12 @@ async function connect(uid, authUser) {
   } catch (e) {
     showError("Connect failed: " + e.message);
     document.getElementById("gateError").textContent = "Couldn't load the workspace. Check your connection and try again.";
-    document.getElementById("chatView").style.display = "none";
-    document.getElementById("gateView").style.display = "flex";
+    // A valid auth session is still present when a workspace read fails. Do not
+    // turn a temporary network/database error into a fake password prompt.
+    document.getElementById("chatView").style.display = "flex";
+    document.getElementById("gateView").style.display = "none";
+    chatLoadFailed = true;
+    document.getElementById("sendBtn").disabled = true;
   }
 }
 
@@ -5986,12 +6123,13 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
     let output, role, taskId = resumeTaskId, cancelled = false, runStatus = null;
     let completionPersisted = false;
     let assistantMessage = null;
+    let persistenceDeferred = false;
     if (visionData) {
       role = "vision";
       addReasoningStep("Image request sent");
       traceEl.innerHTML = `<span class="pipeline-node running">${escapeHtml(role)}</span>`;
       output = await callAgent("vision", visionData.question || "Describe this image in detail.", 1200, visionData.images, history);
-    } else if (resumeTaskId || isComplex(task)) {
+    } else if (resumeTaskId) {
       addReasoningStep(resumeTaskId ? "Resuming saved task" : "Planning request sent");
       const res = await runMultistep(task, traceEl, history, resumeTaskId, { convId: targetConvId, branchId: targetBranchId });
       output = res.result; role = res.role; taskId = res.taskId || taskId;
@@ -5999,12 +6137,19 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
       runStatus = res.status || null;
       completionPersisted = res.completionPersisted === true;
       assistantMessage = res.assistantMessage || null;
+      persistenceDeferred = res.persistenceDeferred === true;
       addReasoningStep(cancelled ? "Run cancelled" : res.steps?.some(([, , result]) => taskFailureKind(result)) ? "Some specialist steps need retry" : "All specialist steps returned");
     } else {
-      const res = await runSimple(task, history);
+      addReasoningStep(isComplex(task) ? "Background agent team queued" : "Background task queued");
+      const res = await runDurableSingleStep(task, traceEl, { convId: targetConvId, branchId: targetBranchId });
       output = res.result; role = res.role;
-      addReasoningStep(`${role} request returned`);
-      traceEl.textContent = "Response received";
+      taskId = res.taskId || taskId;
+      runStatus = res.status || null;
+      completionPersisted = res.completionPersisted === true;
+      assistantMessage = res.assistantMessage || null;
+      persistenceDeferred = res.persistenceDeferred === true;
+      addReasoningStep(persistenceDeferred ? "Task queued for background execution" : `${role} request returned`);
+      if (!persistenceDeferred) traceEl.textContent = "Response received";
     }
 
     if (thinkingWrap && isTargetOpen()) {
@@ -6024,7 +6169,12 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
       else updateJumpButton();
     }
 
-    if (completionPersisted) {
+    if (persistenceDeferred) {
+      // The durable run owns the final assistant row. Do not save this local
+      // queue notice as a second answer; recovery will reconcile the worker's
+      // result when the conversation is reopened.
+      if (thinkingWrap && isTargetOpen()) showInfo("This task is continuing in the background.");
+    } else if (completionPersisted) {
       // The worker inserted this row transactionally with the run completion.
       // Reuse the returned row locally; inserting the same answer in the browser
       // would create a duplicate after a reload.
@@ -6718,6 +6868,26 @@ document.addEventListener("keydown", e => {
   else if (cancelButtons[surface.id]) document.getElementById(cancelButtons[surface.id]).click();
   else hideSurface(surface.id);
 });
+
+// Restore the persisted Supabase session on every page/PWA launch. The login
+// form is only needed after an explicit sign-out or an expired refresh token.
+async function restoreWorkspaceSession() {
+  if (!sb) return;
+  const { data, error } = await sb.auth.getSession();
+  if (error) {
+    console.warn("Could not restore the saved session", error.message);
+    return;
+  }
+  if (data.session?.user) {
+    try {
+      await connectAuthenticatedUser(data.session.user);
+    } catch (restoreError) {
+      showError("Session restore failed: " + restoreError.message);
+    }
+  }
+}
+
+if (sb) setTimeout(() => restoreWorkspaceSession(), 0);
 </script>
 
 </body>
