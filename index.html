@@ -1027,6 +1027,11 @@
     padding: 6px 9px;
     cursor: pointer;
   }
+  .agent-run-recovery-banner { flex-wrap: wrap; }
+  .agent-run-recovery-actions { display: flex; gap: 6px; flex: none; }
+  .agent-run-recovery-actions button { margin: 0; }
+  .agent-run-recovery-status { color: var(--accent); font-family: var(--mono); white-space: nowrap; }
+  .agent-run-recovery-dismiss { color: var(--text-dim) !important; border-color: var(--border) !important; }
 
   .edit-textarea {
     width: 100%;
@@ -2720,13 +2725,17 @@ function setAgentRunUiState(context, status, cancelled = false) {
   if (!context) return;
   context.lastStatus = status || context.lastStatus || "running";
   const wrap = context.traceEl?.closest?.(".msg");
-  const button = wrap?.querySelector(".durable-run-cancel-btn");
-  const label = wrap?.querySelector(".durable-run-status");
+  const button = wrap?.querySelector(".durable-run-cancel-btn") || context.cancelButton;
+  const label = wrap?.querySelector(".durable-run-status") || context.statusEl;
   if (label) label.textContent = durableRunStatusLabel(cancelled ? "cancelled" : context.lastStatus);
   if (button) {
     button.hidden = !["running", "synthesizing"].includes(context.lastStatus) && !cancelled;
     button.disabled = cancelled || context.cancelRequested || !["running", "synthesizing"].includes(context.lastStatus);
     if (cancelled) button.textContent = "Cancelled";
+  }
+  if (context.retryButton) {
+    context.retryButton.hidden = !["paused", "failed"].includes(context.lastStatus);
+    context.retryButton.disabled = context.retrying === true;
   }
 }
 
@@ -2747,6 +2756,7 @@ function applyAgentRunStatus(context, data) {
     context.cancelRequested = true;
     setAgentRunUiState(context, "cancelled", true);
   }
+  if (typeof context.onStatus === "function") context.onStatus(data);
   if (TERMINAL_AGENT_RUN_STATUSES.has(status)) stopAgentRunPolling(context);
   return data;
 }
@@ -3191,6 +3201,225 @@ async function showPendingTaskRecovery(conv) {
   chatLog.parentElement.insertBefore(banner, chatLog.nextSibling);
 }
 
+const AGENT_RUN_RECOVERY_ACTIVE_STATUSES = new Set(["running", "synthesizing"]);
+const AGENT_RUN_RECOVERY_TERMINAL_STATUSES = new Set(["paused", "failed", "completed", "cancelled"]);
+const AGENT_RUN_RECOVERY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+function isRecentAgentRun(run, now = Date.now()) {
+  const timestamp = Date.parse(run?.updated_at || run?.created_at || "");
+  return Number.isFinite(timestamp) && now - timestamp <= AGENT_RUN_RECOVERY_WINDOW_MS;
+}
+
+function shouldRecoverAgentRun(run, now = Date.now()) {
+  if (!run || !Number.isInteger(run.id) || !AGENT_RUN_RECOVERY_TERMINAL_STATUSES.has(run.status)
+    && !AGENT_RUN_RECOVERY_ACTIVE_STATUSES.has(run.status)) return false;
+  return AGENT_RUN_RECOVERY_ACTIVE_STATUSES.has(run.status) || isRecentAgentRun(run, now);
+}
+
+async function loadRecentAgentRuns(conversationId, branchId) {
+  if (!conversationId || !branchId) return [];
+  const { data, error } = await sb.from("agent_runs")
+    .select("*")
+    .eq("conversation_id", conversationId)
+    .order("updated_at", { ascending: false })
+    .limit(20);
+  if (error) throw new Error("Failed to load durable runs: " + error.message);
+  return (data || [])
+    .filter(run => Number(run.branch_id) === Number(branchId) && shouldRecoverAgentRun(run))
+    .sort((a, b) => new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at));
+}
+
+function recoveredRunContent(run) {
+  if (typeof run?.result === "string" && run.result.trim()) return run.result;
+  return durableRunOutput({ run });
+}
+
+function findRecoveredAssistantMessage(run, branchId, candidates = messages) {
+  const content = recoveredRunContent(run);
+  return (candidates || []).find(message => message.role === "assistant"
+    && Number(message.branch_id || branchId) === Number(branchId)
+    && message.content === content) || null;
+}
+
+const agentRunReconciliationInFlight = new Map();
+
+async function reconcileAgentRunMessage(run, branchId) {
+  const key = `${run?.id}:${branchId}`;
+  if (agentRunReconciliationInFlight.has(key)) return agentRunReconciliationInFlight.get(key);
+  const work = reconcileAgentRunMessageOnce(run, branchId);
+  agentRunReconciliationInFlight.set(key, work);
+  try {
+    return await work;
+  } finally {
+    agentRunReconciliationInFlight.delete(key);
+  }
+}
+
+async function reconcileAgentRunMessageOnce(run, branchId) {
+  if (!run || !AGENT_RUN_RECOVERY_TERMINAL_STATUSES.has(run.status)) {
+    return { message: null, inserted: false };
+  }
+  const content = recoveredRunContent(run);
+  const alreadyLoaded = findRecoveredAssistantMessage(run, branchId);
+  if (alreadyLoaded) return { message: alreadyLoaded, inserted: false };
+
+  // The live tab saves the assistant row after the worker returns. A reload can
+  // therefore observe the run before or after that insert. Check the branch in the database before inserting
+  // so reopening a conversation never appends a second copy of a reply that was already persisted.
+  const { data: existing, error: lookupError } = await sb.from("chat_history")
+    .select("id,user_id,conversation_id,branch_id,role,content,version_group,created_at")
+    .eq("branch_id", branchId)
+    .eq("role", "assistant")
+    .eq("content", content)
+    .limit(1);
+  if (lookupError) throw new Error("Failed to reconcile durable reply: " + lookupError.message);
+  if (existing?.length) return { message: existing[0], inserted: false };
+
+  const message = await saveMessage(userId, run.conversation_id, branchId, "assistant", content);
+  return { message, inserted: true };
+}
+
+function addRecoveredAssistantMessage(message) {
+  if (!message || (messages || []).some(item => item.id === message.id
+    || (item.role === "assistant" && Number(item.branch_id) === Number(message.branch_id) && item.content === message.content))) return false;
+  messages.push(message);
+  renderStoredMessage(message, true);
+  return true;
+}
+
+function removeAgentRunRecoveryBanners() {
+  document.querySelectorAll(".agent-run-recovery-banner").forEach(el => el.remove());
+}
+
+function createAgentRunRecoveryBanner(run, context = {}) {
+  const banner = document.createElement("div");
+  banner.className = "task-recovery-banner agent-run-recovery-banner";
+  banner.dataset.agentRunId = String(run.id);
+
+  const text = document.createElement("span");
+  text.textContent = context.message || "Durable run status";
+  const status = document.createElement("span");
+  status.className = "agent-run-recovery-status";
+  status.setAttribute("aria-live", "polite");
+
+  const actions = document.createElement("div");
+  actions.className = "agent-run-recovery-actions";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+  cancel.className = "durable-run-cancel-btn";
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.textContent = "Retry";
+  retry.className = "agent-run-retry-btn";
+  const dismiss = document.createElement("button");
+  dismiss.type = "button";
+  dismiss.textContent = "Dismiss";
+  dismiss.className = "agent-run-recovery-dismiss";
+
+  actions.append(cancel, retry, dismiss);
+  banner.append(text, status, actions);
+  chatLog.parentElement.insertBefore(banner, chatLog.nextSibling);
+
+  context.statusEl = status;
+  context.cancelButton = cancel;
+  context.retryButton = retry;
+  context.bannerEl = banner;
+  cancel.onclick = () => requestAgentRunCancellation(context);
+  retry.onclick = () => retryAgentRun(run, context);
+  dismiss.onclick = () => banner.remove();
+  setAgentRunUiState(context, run.status || "running", run.status === "cancelled");
+  return banner;
+}
+
+async function retryAgentRun(run, context = {}) {
+  if (!run || context.retrying || isSending || isLoadingChat) return;
+  if (Number(run.conversation_id) !== Number(currentConvId) || Number(run.branch_id) !== Number(currentBranchId)) {
+    showInfo("Open the original conversation before retrying this run.");
+    return;
+  }
+  context.retrying = true;
+  setAgentRunUiState(context, run.status);
+  isSending = true;
+  document.getElementById("sendBtn").disabled = true;
+  try {
+    await runAndSaveResponse(`plan: ${run.prompt}`, null, {
+      convId: run.conversation_id, branchId: run.branch_id, messages: messages.slice()
+    });
+    context.bannerEl?.remove();
+  } finally {
+    context.retrying = false;
+    isSending = false;
+    document.getElementById("sendBtn").disabled = isLoadingChat || chatLoadFailed;
+  }
+}
+
+function stopAgentRunRecoveryForOtherConversation(conversationId, branchId) {
+  for (const context of [...activeAgentRuns.values()]) {
+    if (Number(context.conversationId) !== Number(conversationId) || Number(context.branchId) !== Number(branchId)) {
+      stopAgentRunPolling(context);
+    }
+  }
+}
+
+async function recoverAgentRuns(conv, branchId, loadEpoch) {
+  removeAgentRunRecoveryBanners();
+  stopAgentRunRecoveryForOtherConversation(conv.id, branchId);
+  let runs;
+  try {
+    runs = await loadRecentAgentRuns(conv.id, branchId);
+  } catch (error) {
+    // Durable tracking is advisory. Conversation loading and the existing browser
+    // flow remain usable when an older deployment has no agent_runs table yet.
+    console.warn("Durable run recovery unavailable", error.message);
+    return;
+  }
+
+  for (const run of runs) {
+    if (loadEpoch !== conversationLoadEpoch || currentConvId !== conv.id || currentBranchId !== branchId) return;
+    const context = { runId: run.id, conversationId: conv.id, branchId, lastStatus: run.status };
+    if (AGENT_RUN_RECOVERY_ACTIVE_STATUSES.has(run.status)) {
+      createAgentRunRecoveryBanner(run, {
+        message: "A durable run is still processing in the background."
+      });
+      context.onStatus = data => {
+        if (data.run?.status === "completed" || data.run?.status === "paused" || data.run?.status === "failed" || data.run?.status === "cancelled") {
+          reconcileAgentRunMessage(data.run, branchId).then(result => {
+            if (loadEpoch !== conversationLoadEpoch || currentConvId !== conv.id) return;
+            if (result.message && !findRecoveredAssistantMessage(data.run, branchId)) addRecoveredAssistantMessage(result.message);
+            if (result.inserted && data.run.status === "completed") showInfo("A durable run completed while this conversation was closed.");
+          }).catch(error => showError(error.message));
+        }
+      };
+      startAgentRunPolling(context);
+      continue;
+    }
+
+    let reconciliation;
+    try {
+      reconciliation = await reconcileAgentRunMessage(run, branchId);
+      if (reconciliation.message && !findRecoveredAssistantMessage(run, branchId)) {
+        addRecoveredAssistantMessage(reconciliation.message);
+      }
+    } catch (error) {
+      showError(error.message);
+      continue;
+    }
+
+    if (run.status === "completed" && reconciliation.inserted) {
+      const banner = createAgentRunRecoveryBanner(run, {
+        message: "A durable run completed while this conversation was closed."
+      });
+      banner.querySelector(".durable-run-cancel-btn").hidden = true;
+      banner.querySelector(".agent-run-retry-btn").hidden = true;
+    } else if (run.status === "paused" || run.status === "failed") {
+      createAgentRunRecoveryBanner(run, {
+        message: run.status === "paused" ? "A durable run needs attention before it is complete." : "A durable run failed before it completed."
+      });
+    }
+  }
+}
+
 async function loadAgentTask(taskId) {
   const { data: task, error } = await sb.from("agent_tasks").select("*").eq("id", taskId).single();
   if (error) throw new Error("Failed to load saved task: " + error.message);
@@ -3263,6 +3492,13 @@ async function runMultistep(task, traceEl, history = null, resumeTaskId = null, 
   const poll = (...args) => typeof pollAgentRunStatus === "function" ? pollAgentRunStatus(...args) : Promise.resolve(null);
   const stopPolling = context => { if (typeof stopAgentRunPolling === "function") stopAgentRunPolling(context); };
   const setRunUi = (...args) => { if (typeof setAgentRunUiState === "function") setAgentRunUiState(...args); };
+  function markServerCompletion(data, workerResponse = null) {
+    if (!durable) return;
+    durable.completionPersisted = workerResponse?.completion_persisted === true
+      || Number.isInteger(workerResponse?.assistant_message_id)
+      || Number.isInteger(data?.run?.completion_message_id);
+    durable.assistantMessage = workerResponse?.assistant_message || null;
+  }
 
   async function cancelledResult(legacyStatus = "paused") {
     await updateAgentTask(taskId, {
@@ -3321,7 +3557,9 @@ Task: ${clean}`;
     if (durable && typeof invokeAgentRunWorker === "function") {
       try {
         const workerResponse = await invokeAgentRunWorker(runId);
+        markServerCompletion(null, workerResponse);
         const terminal = await waitForAgentRunTerminal(durable);
+        markServerCompletion(terminal, workerResponse);
         await syncLegacyAgentTask(taskId, terminal);
         stepResults = (terminal.steps || []).map(step => step.status === "completed" && step.result
           ? [step.role, step.description, step.result] : null);
@@ -3335,7 +3573,8 @@ Task: ${clean}`;
             : terminal.run.status === "paused" ? "Final answer has gaps" : "Run failed";
           setRunUi(durable, terminal.run.status);
           stopPolling(durable);
-          return { result: output, role: "multi-step", steps: stepResults, taskId, runId, status: terminal.run.status };
+          return { result: output, role: "multi-step", steps: stepResults, taskId, runId, status: terminal.run.status,
+            completionPersisted: durable.completionPersisted, assistantMessage: durable.assistantMessage };
         }
       } catch (error) {
         // A worker request can time out after it has claimed the run. Inspect
@@ -3349,6 +3588,7 @@ Task: ${clean}`;
         }
         applyAgentRunStatus(durable, state);
         if (TERMINAL_AGENT_RUN_STATUSES.has(state.run?.status)) {
+          markServerCompletion(state);
           await syncLegacyAgentTask(taskId, state);
           stepResults = (state.steps || []).map(step => step.status === "completed" && step.result
             ? [step.role, step.description, step.result] : null);
@@ -3360,10 +3600,12 @@ Task: ${clean}`;
           traceEl.textContent = state.run.status === "completed" ? "Final answer generated"
             : state.run.status === "paused" ? "Final answer has gaps" : "Run failed";
           stopPolling(durable);
-          return { result: output, role: "multi-step", steps: stepResults, taskId, runId, status: state.run.status };
+          return { result: output, role: "multi-step", steps: stepResults, taskId, runId, status: state.run.status,
+            completionPersisted: durable.completionPersisted, assistantMessage: durable.assistantMessage };
         }
         if (workerHasStarted(state)) {
           const terminal = await waitForAgentRunTerminal(durable, state);
+          markServerCompletion(terminal);
           await syncLegacyAgentTask(taskId, terminal);
           stepResults = (terminal.steps || []).map(step => step.status === "completed" && step.result
             ? [step.role, step.description, step.result] : null);
@@ -3375,7 +3617,8 @@ Task: ${clean}`;
           traceEl.textContent = terminal.run.status === "completed" ? "Final answer generated"
             : terminal.run.status === "paused" ? "Final answer has gaps" : "Run failed";
           stopPolling(durable);
-          return { result: output, role: "multi-step", steps: stepResults, taskId, runId, status: terminal.run.status };
+          return { result: output, role: "multi-step", steps: stepResults, taskId, runId, status: terminal.run.status,
+            completionPersisted: durable.completionPersisted, assistantMessage: durable.assistantMessage };
         }
         if (typeof showInfo === "function") showInfo("The server worker could not start; continuing this task in the browser.");
         durable.workerFallback = true;
@@ -3502,7 +3745,7 @@ Task: ${clean}`;
     setRunUi(durable, finalStatus);
     stopPolling(durable);
   }
-  return { result: final, role: "multi-step", steps: stepResults, taskId, runId };
+   return { result: final, role: "multi-step", steps: stepResults, taskId, runId };
 }
 
 async function retryAgentTask(taskId) {
@@ -5090,6 +5333,8 @@ async function openConversation(conv) {
     versionMap = loadedVersionMap;
     await renderMessageBatch(messages);
     if (loadEpoch !== conversationLoadEpoch) return;
+    await recoverAgentRuns(conv, branchId, loadEpoch);
+    if (loadEpoch !== conversationLoadEpoch) return;
     await showPendingTaskRecovery(conv);
     closeMobileSidebar();
   } catch (e) {
@@ -5732,6 +5977,8 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
 
   try {
     let output, role, taskId = resumeTaskId, cancelled = false, runStatus = null;
+    let completionPersisted = false;
+    let assistantMessage = null;
     if (visionData) {
       role = "vision";
       addReasoningStep("Image request sent");
@@ -5743,6 +5990,8 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
       output = res.result; role = res.role; taskId = res.taskId || taskId;
       cancelled = res.cancelled === true;
       runStatus = res.status || null;
+      completionPersisted = res.completionPersisted === true;
+      assistantMessage = res.assistantMessage || null;
       addReasoningStep(cancelled ? "Run cancelled" : res.steps?.some(([, , result]) => taskFailureKind(result)) ? "Some specialist steps need retry" : "All specialist steps returned");
     } else {
       const res = await runSimple(task, history);
@@ -5768,10 +6017,22 @@ async function runAndSaveResponse(task, visionData = null, target = null) {
       else updateJumpButton();
     }
 
-    const savedMsg = await saveMessage(userId, targetConvId, targetBranchId, "assistant", output);
-    if (thinkingWrap && isTargetOpen()) {
-      bindMessageId(thinkingWrap, savedMsg.id);
-      messages.push(savedMsg);
+    if (completionPersisted) {
+      // The worker inserted this row transactionally with the run completion.
+      // Reuse the returned row locally; inserting the same answer in the browser
+      // would create a duplicate after a reload.
+      if (assistantMessage?.id && thinkingWrap && isTargetOpen()) {
+        bindMessageId(thinkingWrap, assistantMessage.id);
+        messages.push(assistantMessage);
+      }
+    } else {
+      // Browser execution remains the compatibility fallback for deployments
+      // where the durable worker could not be started.
+      const savedMsg = await saveMessage(userId, targetConvId, targetBranchId, "assistant", output);
+      if (thinkingWrap && isTargetOpen()) {
+        bindMessageId(thinkingWrap, savedMsg.id);
+        messages.push(savedMsg);
+      }
     }
   } catch (err) {
     traceEl.innerHTML = `<span class="pipeline-node">error</span>`;
