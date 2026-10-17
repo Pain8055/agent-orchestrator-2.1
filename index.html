@@ -2637,6 +2637,13 @@ async function getAuthHeaders() {
   return { "Content-Type": "application/json", Authorization: `Bearer ${data.session.access_token}` };
 }
 
+function createClientRequestId() {
+  const randomUuid = globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+  return `quorum-${randomUuid}`;
+}
+
 async function createAgentRun(prompt, target, steps) {
   const { res, data } = await fetchJsonWithTimeout(AGENT_RUNS_ENDPOINT, {
     method: "POST",
@@ -2647,7 +2654,7 @@ async function createAgentRun(prompt, target, steps) {
       branch_id: target.branchId,
       prompt,
       steps: steps.map(([role, description]) => ({ role, description })),
-      client_request_id: crypto.randomUUID(),
+       client_request_id: createClientRequestId(),
     }),
   });
   if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
