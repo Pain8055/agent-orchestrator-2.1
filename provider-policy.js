@@ -13,16 +13,26 @@
     configurationCooldownMs: 10 * 60000,
   });
 
-  // Verified against official catalogs; availability and account quotas can change.
+  // Provider/model IDs are deployment configuration; availability and account
+  // quotas can change without notice.
   const groq = { provider: 'groq', model: 'openai/gpt-oss-120b' };
   const gemini = { provider: 'gemini', model: 'gemini-3.6-flash' };
   const nemotron = { provider: 'openrouter', model: 'nvidia/nemotron-3-super-120b-a12b:free' };
   const qwen = { provider: 'openrouter', model: 'qwen/qwen3.8-27b:free' };
   const lightning = { provider: 'openrouter', model: 'nvidia/nemotron-3.5-lightning:free' };
+  // APInex models are configured as a separate server-side provider. JEV is
+  // reserved for head/planning work; the other routes use the faster general
+  // and specialist models before falling back to the existing providers.
+  const apinexJev = { provider: 'apinex', model: 'free/jev-1.13' };
+  const apinexGlm = { provider: 'apinex', model: 'free/glm-5.3-flash' };
+  const apinexQwen = { provider: 'apinex', model: 'free/qwen-3.8-max' };
+  const apinexDeepseek = { provider: 'apinex', model: 'free/deepseek-v4.1-flash' };
   const models = {
-    // Try independent providers before spending more attempts on one shared quota.
-    general: [groq, gemini, nemotron, qwen, lightning],
-    specialist: [nemotron, gemini, groq, qwen, lightning],
+    // Try APInex's free balance first, then independent providers before
+    // spending more attempts on one shared quota.
+    head: [apinexJev, apinexGlm, groq, gemini, nemotron, qwen, lightning],
+    general: [apinexGlm, apinexQwen, groq, gemini, nemotron, qwen, lightning],
+    specialist: [apinexDeepseek, gemini, nemotron, groq, apinexQwen, qwen, lightning],
     vision: [gemini, qwen],
   };
 

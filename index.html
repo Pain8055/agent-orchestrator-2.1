@@ -2134,11 +2134,13 @@ const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 const GROQ_ENDPOINT = "https://owgdngmkuuqzrdbqekeh.supabase.co/functions/v1/smooth-task";
 const OPENROUTER_ENDPOINT = "https://owgdngmkuuqzrdbqekeh.supabase.co/functions/v1/Openrouter-chat";
 const GEMINI_ENDPOINT = "https://owgdngmkuuqzrdbqekeh.supabase.co/functions/v1/gemini-chat";
+const APINEX_ENDPOINT = "https://owgdngmkuuqzrdbqekeh.supabase.co/functions/v1/apinex-chat";
 
 const PROVIDER_ENDPOINTS = {
   groq: GROQ_ENDPOINT,
   openrouter: OPENROUTER_ENDPOINT,
   gemini: GEMINI_ENDPOINT,
+  apinex: APINEX_ENDPOINT,
 };
 const TAVILY_ENDPOINT = "https://owgdngmkuuqzrdbqekeh.supabase.co/functions/v1/Tavily-chat1";
 const GITHUB_ENDPOINT = "https://owgdngmkuuqzrdbqekeh.supabase.co/functions/v1/github-chat";
@@ -2434,7 +2436,7 @@ try {
 
 // Exact model IDs and modality-aware fallback order live in provider-policy.js.
 const AGENTS = {
-  head: { system: "You are the lead orchestrator of an AI agent team. You plan, delegate, and give clear final answers.", providers: ProviderPolicy.models.general },
+  head: { system: "You are the lead orchestrator of an AI agent team. You plan, delegate, and give clear final answers.", providers: ProviderPolicy.models.head },
   code: { system: "You are a senior software engineer. Write correct, clean, working code. Briefly explain key decisions. No fluff.", providers: ProviderPolicy.models.specialist },
   debug: { system: "You are a debugging specialist. Given broken code or an error, find the root cause precisely and give the exact fix. Explain WHY it broke.", providers: ProviderPolicy.models.specialist },
   reasoning: { system: "You are a reasoning and math specialist. Solve problems step by step, show your work, double-check your final answer.", providers: ProviderPolicy.models.specialist },
