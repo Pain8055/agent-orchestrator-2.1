@@ -20,17 +20,17 @@
   const nemotron = { provider: 'openrouter', model: 'nvidia/nemotron-3-super-120b-a12b:free' };
   const qwen = { provider: 'openrouter', model: 'qwen/qwen3.8-27b:free' };
   const lightning = { provider: 'openrouter', model: 'nvidia/nemotron-3.5-lightning:free' };
-  // APInex models are configured as a separate server-side provider. JEV is
-  // reserved for head/planning work; the other routes use the faster general
-  // and specialist models before falling back to the existing providers.
-  const apinexJev = { provider: 'apinex', model: 'free/jev-1.13' };
+  // APInex models are configured as a separate server-side provider. JEV is a
+  // Decisions API model, not a normal chat-completions model, so it is not put
+  // on the chat routes below. It can be added later through a dedicated typed
+  // task-classification call without breaking normal synthesis.
   const apinexGlm = { provider: 'apinex', model: 'free/glm-5.3-flash' };
   const apinexQwen = { provider: 'apinex', model: 'free/qwen-3.8-max' };
   const apinexDeepseek = { provider: 'apinex', model: 'free/deepseek-v4.1-flash' };
   const models = {
     // Try APInex's free balance first, then independent providers before
     // spending more attempts on one shared quota.
-    head: [apinexJev, apinexGlm, groq, gemini, nemotron, qwen, lightning],
+    head: [apinexGlm, apinexQwen, groq, gemini, nemotron, qwen, lightning],
     general: [apinexGlm, apinexQwen, groq, gemini, nemotron, qwen, lightning],
     specialist: [apinexDeepseek, gemini, nemotron, groq, apinexQwen, qwen, lightning],
     vision: [gemini, qwen],
